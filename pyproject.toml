@@ -1,0 +1,17 @@
+[project]
+name = "webgent"
+version = "0.1.0"
+description = "Playwright-based MCP server for browser automation"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "playwright>=1.60.0",
+    "fastmcp>=2.0,<3",
+]
+
+[project.scripts]
+webgent = "webgent.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
