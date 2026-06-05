@@ -118,6 +118,16 @@ FULL_CONTROLS_PAGE_URL = (
     "</form></body></html>"
 )
 
+FETCH_PAGE_URL = (
+    "data:text/html,<html><body>"
+    "<button aria-label='Fetch data'>Fetch data</button>"
+    "<script>"
+    "document.querySelector('button').onclick=function(){"
+    "fetch('https://example.org/');};"
+    "</script>"
+    "</body></html>"
+)
+
 SEARCH_TYPE_PAGE_URL = (
     "data:text/html,<html><body>"
     "<input aria-label='Search Amazon.in'>"
@@ -536,6 +546,79 @@ async def test_action_metadata_only() -> None:
         await manager.stop()
 
 
+def assert_request_summaries(requests: list[dict]) -> str:
+    assert requests, "expected at least one captured request"
+    for entry in requests:
+        assert "id" in entry
+        assert "method" in entry
+        assert "resource_type" in entry
+        assert "url" in entry
+        assert "status" in entry
+        assert "body" not in entry
+        assert "headers" not in entry
+    return requests[0]["id"]
+
+
+async def test_network_capture() -> None:
+    manager = BrowserManager()
+    await manager.start()
+    try:
+        session_info = await manager.create_session(
+            "network-capture-test",
+            initial_url="about:blank",
+        )
+        session = manager.get_session(session_info["session_id"])
+
+        navigated = await session.goto("https://example.com")
+        assert "requests" not in navigated
+
+        captured = await session.goto(
+            "https://example.org",
+            capture_requests=True,
+        )
+        assert "requests" in captured
+        request_id = assert_request_summaries(captured["requests"])
+
+        req_headers = await session.get_captured_request_headers(request_id)
+        assert req_headers["request_id"] == request_id
+        assert isinstance(req_headers["headers"], dict)
+        assert req_headers["headers"]
+
+        resp_headers = await session.get_captured_response_headers(request_id)
+        assert resp_headers["request_id"] == request_id
+        assert resp_headers["status"] is not None
+        assert isinstance(resp_headers["headers"], dict)
+
+        response = await session.get_captured_response(request_id)
+        assert response["request_id"] == request_id
+        assert response["status"] is not None
+        assert response["body"]
+        assert response["size"] > 0
+
+        await session.goto(FETCH_PAGE_URL)
+        interactables = await session.page_interactables()
+        fetch_ref = find_ref(interactables["interactables"], "button", "fetch data")
+        assert fetch_ref is not None
+        clicked = await session.click(fetch_ref, capture_requests=True)
+        xhr_requests = [
+            entry
+            for entry in clicked.get("requests", [])
+            if entry["resource_type"] in {"fetch", "xhr"}
+        ]
+        assert xhr_requests, "expected fetch/xhr request after click"
+        assert xhr_requests[0]["method"] == "GET"
+
+        await manager.close_session(session_info["session_id"])
+        try:
+            manager.get_session(session_info["session_id"])
+            raise AssertionError("expected closed session to be removed")
+        except ValueError:
+            pass
+        print("network capture smoke test passed")
+    finally:
+        await manager.stop()
+
+
 async def test_mcp_tools() -> None:
     async with Client(str(SERVER_PATH)) as client:
         tools = await client.list_tools()
@@ -547,6 +630,8 @@ async def test_mcp_tools() -> None:
             "delete_page",
             "switch_page",
             "goto",
+            "go_back",
+            "go_forward",
             "close_session",
             "snapshot",
             "interactables",
@@ -564,6 +649,9 @@ async def test_mcp_tools() -> None:
             "select_tab",
             "get_url",
             "screenshot",
+            "get_captured_response",
+            "get_captured_request_headers",
+            "get_captured_response_headers",
         }
         assert expected.issubset(tool_names), f"missing tools: {expected - tool_names}"
 
@@ -824,6 +912,35 @@ async def test_mcp_tools() -> None:
         assert result.data["active_page_id"] == page_id
 
         result = await client.call_tool(
+            "goto",
+            {
+                "session_id": session_id,
+                "url": "https://example.net",
+                "capture_requests": True,
+            },
+        )
+        assert "requests" in result.data
+        request_id = assert_request_summaries(result.data["requests"])
+
+        result = await client.call_tool(
+            "get_captured_request_headers",
+            {"session_id": session_id, "request_id": request_id},
+        )
+        assert result.data["headers"]
+
+        result = await client.call_tool(
+            "get_captured_response_headers",
+            {"session_id": session_id, "request_id": request_id},
+        )
+        assert result.data["headers"]
+
+        result = await client.call_tool(
+            "get_captured_response",
+            {"session_id": session_id, "request_id": request_id},
+        )
+        assert result.data["body"]
+
+        result = await client.call_tool(
             "close_session",
             {"session_id": session_id},
         )
@@ -836,6 +953,7 @@ async def main() -> None:
     test_interactive_snapshot_helpers()
     await test_browser_manager()
     await test_action_metadata_only()
+    await test_network_capture()
     await test_mcp_tools()
 
 

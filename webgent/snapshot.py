@@ -344,6 +344,23 @@ def ref_locator(page: Page, ref: str) -> Locator:
     return page.locator(f"aria-ref={normalized}")
 
 
+_REF_NOT_FOUND_MSG = (
+    "Call interactables again to get fresh refs after navigation or DOM changes."
+)
+
+
+async def resolve_ref_locator(page: Page, ref: str) -> Locator:
+    normalized = normalize_ref(ref)
+    locator = ref_locator(page, normalized)
+    if await locator.count() > 0:
+        return locator
+    await page.aria_snapshot(mode="ai")
+    locator = ref_locator(page, normalized)
+    if await locator.count() == 0:
+        raise ValueError(f"Ref {normalized!r} not found on the page. {_REF_NOT_FOUND_MSG}")
+    return locator
+
+
 async def read_locator_value(locator: Locator) -> str:
     try:
         value = await locator.input_value()
@@ -359,7 +376,7 @@ def _click_intercepted(exc: BaseException) -> bool:
 
 
 async def click_ref(page: Page, ref: str) -> None:
-    locator = ref_locator(page, ref)
+    locator = await resolve_ref_locator(page, ref)
     try:
         await locator.click()
     except Exception as exc:
@@ -798,9 +815,7 @@ async def get_node_result(
     max_url_len: int = DEFAULT_MAX_URL_LEN,
 ) -> dict[str, Any]:
     normalized = normalize_ref(ref)
-    locator = ref_locator(page, normalized)
-    if await locator.count() == 0:
-        raise ValueError(f"Element {ref!r} was not found on the page")
+    locator = await resolve_ref_locator(page, normalized)
 
     subtree = await capture_tree_snapshot(
         page,

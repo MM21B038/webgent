@@ -1,0 +1,16 @@
+[browser]
+# Run Chromium without a visible window (useful on servers or SSH).
+headless = false
+
+# X11 display for headed mode. Leave empty to use the process DISPLAY env.
+# webgent sets this before launching Chromium when non-empty.
+display = ":0.0"
+
+[server]
+transport = "http"
+host = "127.0.0.1"
+port = 3333
+
+[mcp.cursor]
+# Suggested Cursor MCP server entry — copy into Cursor MCP settings.
+url = "http://127.0.0.1:1234/mcp"

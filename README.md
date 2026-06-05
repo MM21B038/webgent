@@ -25,29 +25,54 @@ uv sync
 uv run playwright install chromium
 ```
 
+## Configuration
+
+Edit `settings.toml` in the project root:
+
+```toml
+[browser]
+headless = false
+display = ":0.0"
+
+[server]
+transport = "http"
+host = "127.0.0.1"
+port = 1234
+
+[mcp.cursor]
+url = "http://127.0.0.1:1234/mcp"
+```
+
+- **`headless`** — `false` opens a visible Chromium window; `true` runs without a display (servers, SSH, CI).
+- **`display`** — X11 display for headed mode (e.g. `:0.0`). When set, webgent applies it before launching the browser. Leave empty to use the process `DISPLAY` env.
+- **`server`** — HTTP transport settings. The MCP endpoint is `http://{host}:{port}/mcp`.
+- **`mcp.cursor`** — suggested URL for the Cursor MCP entry below.
+
 ## Run
 
-Start the MCP server (stdio):
+Start the MCP server over HTTP:
 
 ```bash
 uv run webgent
 ```
 
+The server listens at `http://127.0.0.1:1234/mcp` by default (see `settings.toml`).
+
 ### Cursor MCP config
 
-Add to your MCP settings (adjust the path):
+Start `webgent` first, then add to your MCP settings using the URL from `settings.toml` (`mcp.cursor`):
 
 ```json
 {
   "mcpServers": {
     "webgent": {
-      "command": "uv",
-      "args": ["run", "webgent"],
-      "cwd": "d:/app/backend/webgent"
+      "url": "http://127.0.0.1:1234/mcp"
     }
   }
 }
 ```
+
+Display and headless mode are read from `settings.toml` at server startup — no need to pass `DISPLAY` in the MCP env block.
 
 Restart Cursor after changing MCP config or server code.
 
@@ -153,7 +178,8 @@ webgent/
   snapshot.py    Snapshots, interactables tree, ref helpers
   screenshot.py  Screenshot capture
   files.py       Upload file resolution
-  config.py      Paths (profile/, media/)
+  config.py      Settings loader and paths (profile/, media/)
+settings.toml    Browser headless/display and MCP hints
 profile/         Persistent browser profiles
 media/           Screenshot output
 scripts/         Smoke tests
