@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
 import warnings
 
 from authlib.deprecate import AuthlibDeprecationWarning
@@ -13,6 +15,12 @@ warnings.filterwarnings(
 from fastmcp import Context, FastMCP
 
 from webgent.browser import BrowserManager
+from webgent.config import (
+    PROMPT_NAME,
+    PROMPT_PATH,
+    README_PATH,
+    SERVER_INFO_RESOURCE_URI,
+)
 from webgent.mcp_tools import wrap_tool_result
 
 _manager: BrowserManager | None = None
@@ -47,6 +55,30 @@ def tool(*, description: str):
     return decorator
 
 
+def _read_project_markdown(path: Path) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing project file: {path.name}")
+    return path.read_text(encoding="utf-8")
+
+
+@mcp.resource(
+    SERVER_INFO_RESOURCE_URI,
+    name="server-info",
+    description="Project README: install, configuration, tools, and agent workflow.",
+    mime_type="text/markdown",
+)
+def readme() -> str:
+    return _read_project_markdown(README_PATH)
+
+
+@mcp.prompt(
+    name=PROMPT_NAME,
+    description="Agent instructions for when and how to use webgent MCP tools.",
+)
+def prompt() -> str:
+    return _read_project_markdown(PROMPT_PATH)
+
+
 _ACTION_DOC = (
     "Returns page_id, active_page_id, ref, url, and title. "
     "If a click opens a new tab, page_id switches to the new tab."
@@ -54,7 +86,7 @@ _ACTION_DOC = (
 _CAPTURE_DOC = (
     " capture_requests=true records network activity during the action and returns "
     "a compact requests list (id, method, resource_type, url, status). "
-    "Fetch bodies and headers separately by request id."
+    "Fetch request/response bodies and headers separately by request id."
 )
 
 CREATE_SESSION_DOC = (
@@ -88,6 +120,7 @@ INTERACTABLES_DOC = (
 )
 GET_NODE_DOC = (
     "Get role, name, states, value, checked, and a small subtree for one ref. "
+    "Role is resolved from the DOM (file, checkbox, radio, combobox, etc.). "
     "depth defaults to 3 unless passed."
 )
 GET_URL_DOC = "Get the full href for a link ref."
@@ -97,7 +130,12 @@ CLICK_DOC = (
     + _CAPTURE_DOC
 )
 TYPE_DOC = "Type into an editable element by ref. " + _ACTION_DOC + _CAPTURE_DOC
-FILL_DOC = "Fill an input by ref. " + _ACTION_DOC + _CAPTURE_DOC
+FILL_DOC = (
+    "Fill an input by ref; verifies the value was written to the DOM. "
+    "Readonly jQuery UI / flatpickr / native date inputs accept dd-mm-yyyy or yyyy-mm-dd. "
+    + _ACTION_DOC
+    + _CAPTURE_DOC
+)
 SELECT_OPTION_DOC = "Select dropdown values by ref. " + _ACTION_DOC + _CAPTURE_DOC
 SET_CHECKBOX_DOC = "Set checkbox checked state by ref. " + _ACTION_DOC + _CAPTURE_DOC
 SELECT_RADIO_DOC = "Select a radio option by ref. " + _ACTION_DOC + _CAPTURE_DOC
@@ -109,17 +147,63 @@ SET_SPINBUTTON_DOC = (
 )
 SELECT_TAB_DOC = "Select a tab by ref. " + _ACTION_DOC + _CAPTURE_DOC
 SCREENSHOT_DOC = "Save a viewport, full-page, or element PNG/JPEG under media/."
+CAPTCHA_OCR_DOC = (
+    "Screenshot a captcha image element by ref and run ddddocr text recognition. "
+    "Returns ref and recognized text. Use beta=true for the newer model; "
+    "png_fix=true for transparent PNG captchas."
+)
 GET_CAPTURED_RESPONSE_DOC = (
-    "Get response body for a captured request id from a prior action. "
-    "Data is ephemeral and cleared on close_session."
+    "Get response body for a captured or registered request id. "
+    "HTML responses are returned as parsed snapshot YAML when format=tree; "
+    "format=raw returns the original response text. "
+    "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
+)
+EVALUATE_JS_DOC = (
+    "Run JavaScript in the active page context via page.evaluate. "
+    "Returns JSON-serializable result and type. Optional arg is passed to the expression."
+)
+GET_FORM_DATA_DOC = (
+    "Extract form fields from the page, including hidden inputs and csrf_token "
+    "from meta[name=csrf-token]. Returns all forms plus the selected form by form_index."
+)
+GET_COOKIES_DOC = (
+    "List cookies in the browser session. Optional urls filters cookies for those URLs."
+)
+SET_COOKIES_DOC = (
+    "Add cookies to the browser session. Each cookie needs name, value, domain, and path."
+)
+HTTP_REQUEST_DOC = (
+    "Send an HTTP request using the session cookie jar via context.request. "
+    "Supports raw body, form data dict, or json dict. "
+    "HTML responses use format=tree for snapshot YAML or format=raw for text."
+)
+ENCRYPT_RSA_DOC = (
+    "Encrypt plaintext for form submission. password_mode=page uses the loaded page's "
+    "encryption JS; password_mode=rsa encrypts server-side with public_key (PEM or base64 SPKI)."
+)
+REPLAY_REQUEST_DOC = (
+    "Replay a captured or registered request with optional field overrides. "
+    "refresh_token reloads the referer page and updates _token / X-CSRF-TOKEN. "
+    "encrypt_password re-encrypts the password field via page JS or RSA."
 )
 GET_CAPTURED_REQUEST_HEADERS_DOC = (
-    "Get request headers for a captured request id. "
-    "Data is ephemeral and cleared on close_session."
+    "Get request headers for a captured or registered request id. "
+    "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
+)
+GET_CAPTURED_REQUEST_BODY_DOC = (
+    "Get request body for a captured or registered request id. "
+    "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
 )
 GET_CAPTURED_RESPONSE_HEADERS_DOC = (
-    "Get response headers for a captured request id. "
-    "Data is ephemeral and cleared on close_session."
+    "Get response headers for a captured or registered request id. "
+    "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
+)
+REGISTER_REQUEST_DOC = (
+    "Persist a captured request id to registry/{request_id}/ as four files: "
+    "request_header, response_header, request_body, and response (raw body bytes). "
+    "HTML responses are converted to snapshot YAML when fetched via get_captured_response. "
+    "Looks up ephemeral captures across active sessions; registered entries "
+    "are read by get_captured_* tools using only request_id."
 )
 
 
@@ -299,6 +383,49 @@ async def get_url(
 ) -> dict:
     session = _get_manager().get_session(session_id)
     return await session.get_link_url(ref, page_id)
+
+
+@tool(description=EVALUATE_JS_DOC)
+async def evaluate_js(
+    ctx: Context,
+    session_id: str,
+    expression: str,
+    page_id: str | None = None,
+    arg: Any = None,
+) -> dict:
+    session = _get_manager().get_session(session_id)
+    return await session.evaluate_js(expression, page_id, arg=arg)
+
+
+@tool(description=GET_FORM_DATA_DOC)
+async def get_form_data(
+    ctx: Context,
+    session_id: str,
+    page_id: str | None = None,
+    form_index: int = 0,
+) -> dict:
+    session = _get_manager().get_session(session_id)
+    return await session.get_form_data(page_id, form_index=form_index)
+
+
+@tool(description=GET_COOKIES_DOC)
+async def get_cookies(
+    ctx: Context,
+    session_id: str,
+    urls: list[str] | None = None,
+) -> dict:
+    session = _get_manager().get_session(session_id)
+    return await session.get_cookies(urls=urls)
+
+
+@tool(description=SET_COOKIES_DOC)
+async def set_cookies(
+    ctx: Context,
+    session_id: str,
+    cookies: list[dict[str, Any]],
+) -> dict:
+    session = _get_manager().get_session(session_id)
+    return await session.set_cookies(cookies)
 
 
 @tool(description=CLICK_DOC)
@@ -536,35 +663,141 @@ async def select_tab(
     )
 
 
+@tool(description=REGISTER_REQUEST_DOC)
+async def register_request(
+    ctx: Context,
+    request_id: str,
+) -> dict:
+    return await _get_manager().register_request(request_id)
+
+
 @tool(description=GET_CAPTURED_RESPONSE_DOC)
 async def get_captured_response(
     ctx: Context,
-    session_id: str,
     request_id: str,
     max_bytes: int = 32768,
+    format: str = "tree",
 ) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.get_captured_response(request_id, max_bytes=max_bytes)
+    if format not in {"tree", "raw"}:
+        raise ValueError("format must be 'tree' or 'raw'")
+    return await _get_manager().get_captured_response(
+        request_id,
+        max_bytes=max_bytes,
+        format=format,  # type: ignore[arg-type]
+    )
 
 
 @tool(description=GET_CAPTURED_REQUEST_HEADERS_DOC)
 async def get_captured_request_headers(
     ctx: Context,
-    session_id: str,
     request_id: str,
 ) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.get_captured_request_headers(request_id)
+    return await _get_manager().get_captured_request_headers(request_id)
+
+
+@tool(description=GET_CAPTURED_REQUEST_BODY_DOC)
+async def get_captured_request_body(
+    ctx: Context,
+    request_id: str,
+    max_bytes: int = 32768,
+) -> dict:
+    return await _get_manager().get_captured_request_body(request_id, max_bytes=max_bytes)
 
 
 @tool(description=GET_CAPTURED_RESPONSE_HEADERS_DOC)
 async def get_captured_response_headers(
     ctx: Context,
-    session_id: str,
     request_id: str,
 ) -> dict:
+    return await _get_manager().get_captured_response_headers(request_id)
+
+
+@tool(description=HTTP_REQUEST_DOC)
+async def http_request(
+    ctx: Context,
+    session_id: str,
+    method: str,
+    url: str,
+    headers: dict[str, str] | None = None,
+    body: str | None = None,
+    data: dict[str, str] | None = None,
+    json: dict[str, Any] | None = None,
+    content_type: str | None = None,
+    max_bytes: int = 32768,
+    format: str = "tree",
+) -> dict:
+    if format not in {"tree", "raw"}:
+        raise ValueError("format must be 'tree' or 'raw'")
     session = _get_manager().get_session(session_id)
-    return await session.get_captured_response_headers(request_id)
+    return await session.http_request(
+        method=method,
+        url=url,
+        headers=headers,
+        body=body,
+        data=data,
+        json_body=json,
+        content_type=content_type,
+        max_bytes=max_bytes,
+        format=format,  # type: ignore[arg-type]
+    )
+
+
+@tool(description=ENCRYPT_RSA_DOC)
+async def encrypt_rsa(
+    ctx: Context,
+    plaintext: str,
+    public_key: str | None = None,
+    session_id: str | None = None,
+    page_id: str | None = None,
+    password_mode: str = "page",
+    expression: str | None = None,
+) -> dict:
+    if password_mode not in {"page", "rsa"}:
+        raise ValueError("password_mode must be 'page' or 'rsa'")
+    if session_id is None:
+        raise ValueError("session_id is required")
+    session = _get_manager().get_session(session_id)
+    return await session.encrypt_rsa(
+        plaintext,
+        public_key=public_key,
+        page_id=page_id,
+        password_mode=password_mode,  # type: ignore[arg-type]
+        expression=expression,
+    )
+
+
+@tool(description=REPLAY_REQUEST_DOC)
+async def replay_request(
+    ctx: Context,
+    session_id: str,
+    request_id: str,
+    overrides: dict[str, str] | None = None,
+    refresh_token: bool = False,
+    refresh_url: str | None = None,
+    encrypt_password: bool = False,
+    password_mode: str = "page",
+    public_key: str | None = None,
+    expression: str | None = None,
+    max_bytes: int = 32768,
+    format: str = "tree",
+) -> dict:
+    if password_mode not in {"page", "rsa"}:
+        raise ValueError("password_mode must be 'page' or 'rsa'")
+    if format not in {"tree", "raw"}:
+        raise ValueError("format must be 'tree' or 'raw'")
+    return await _get_manager().replay_request(
+        session_id,
+        request_id,
+        overrides=overrides,
+        refresh_token=refresh_token,
+        refresh_url=refresh_url,
+        encrypt_password=encrypt_password,
+        password_mode=password_mode,  # type: ignore[arg-type]
+        public_key=public_key,
+        expression=expression,
+        max_bytes=max_bytes,
+        format=format,  # type: ignore[arg-type]
+    )
 
 
 @tool(description=SCREENSHOT_DOC)
@@ -584,6 +817,24 @@ async def screenshot(
         full_page=full_page,
         image_type=image_type,
         quality=quality,
+    )
+
+
+@tool(description=CAPTCHA_OCR_DOC)
+async def captcha_ocr(
+    ctx: Context,
+    session_id: str,
+    ref: str,
+    page_id: str | None = None,
+    beta: bool = False,
+    png_fix: bool = False,
+) -> dict:
+    session = _get_manager().get_session(session_id)
+    return await session.captcha_ocr(
+        ref,
+        page_id,
+        beta=beta,
+        png_fix=png_fix,
     )
 
 

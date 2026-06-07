@@ -10,6 +10,8 @@ from webgent.browser import BrowserManager
 from webgent.snapshot import (
     compress_snapshot,
     extract_ref_from_line,
+    normalize_ref,
+    parse_node_headline,
     to_interactive_snapshot,
     truncate_url,
 )
@@ -128,6 +130,56 @@ FETCH_PAGE_URL = (
     "</body></html>"
 )
 
+POST_FETCH_PAGE_URL = (
+    "data:text/html,<html><body>"
+    "<button aria-label='Post data'>Post data</button>"
+    "<script>"
+    "document.querySelector('button').onclick=function(){"
+    "fetch('https://example.org/',{method:'POST',"
+    "headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({hello:'world'})});};"
+    "</script>"
+    "</body></html>"
+)
+
+FORM_UPLOAD_POST_PAGE_URL = (
+    "data:text/html,<html><body>"
+    "<form action='https://httpbin.org/post' method='POST' "
+    "enctype='multipart/form-data'>"
+    "<input name='field1' value='hello'>"
+    "<input type='file' name='file'>"
+    "<button type='submit'>Upload submit</button>"
+    "</form></body></html>"
+)
+
+FORM_DATA_PAGE_URL = (
+    "data:text/html,<html><head>"
+    "<meta name='csrf-token' content='csrf-abc'>"
+    "</head><body>"
+    "<form action='/submit' method='POST'>"
+    "<input type='hidden' name='_token' value='tok-abc'>"
+    "<input name='email' value=''>"
+    "<input name='captcha' value=''>"
+    "<button type='submit'>Send</button>"
+    "</form></body></html>"
+)
+
+URLENCODED_FORM_PAGE_URL = (
+    "data:text/html,<html><body>"
+    "<form action='https://httpbingo.org/post' method='POST'>"
+    "<input type='hidden' name='_token' value='tok123'>"
+    "<input name='field1' value='hello'>"
+    "<button type='submit'>Submit encoded</button>"
+    "</form></body></html>"
+)
+
+ENCRYPT_PAGE_URL = (
+    "data:text/html,<html><body>"
+    "<script>window.encryptPassword=function(pw){return btoa(pw);};</script>"
+    "<input type='password' name='password'>"
+    "</body></html>"
+)
+
 SEARCH_TYPE_PAGE_URL = (
     "data:text/html,<html><body>"
     "<input aria-label='Search Amazon.in'>"
@@ -140,6 +192,21 @@ SEARCH_TYPE_PAGE_URL = (
     "document.title='Search: '+input.value;"
     "suggestions.hidden=!input.value;"
     "});"
+    "</script>"
+    "</body></html>"
+)
+
+CAPTCHA_PAGE_URL = (
+    "data:text/html,<html><body>"
+    "<img alt='Captcha' id='cap'>"
+    "<script>"
+    "const c=document.createElement('canvas');"
+    "c.width=120;c.height=40;"
+    "const x=c.getContext('2d');"
+    "x.fillStyle='#fff';x.fillRect(0,0,120,40);"
+    "x.fillStyle='#000';x.font='bold 28px monospace';"
+    "x.fillText('8K4M',15,30);"
+    "document.getElementById('cap').src=c.toDataURL('image/png');"
     "</script>"
     "</body></html>"
 )
@@ -231,7 +298,157 @@ def test_interactive_snapshot_helpers() -> None:
         '  - [e2] img "Product photo" [cursor=pointer]',
         '  - [e3] button "Buy"',
     ]
+
+    tree_headline = parse_node_headline('- file "Upload file" [ref=e3]')
+    assert tree_headline == {
+        "ref": "e3",
+        "role": "file",
+        "name": "Upload file",
+        "states": [],
+    }
+    compact_headline = parse_node_headline('- [e4] checkbox "Subscribe" [checked]')
+    assert compact_headline == {
+        "ref": "e4",
+        "role": "checkbox",
+        "name": "Subscribe",
+        "states": ["checked"],
+    }
+
+    frame_tree = (
+        '- generic [ref=e1]:\n'
+        '  - iframe [ref=e2]:\n'
+        '    - generic [ref=f1e1]:\n'
+        '      - button "Close ad" [ref=f1e2] [cursor=pointer]'
+    )
+    frame_interactive = to_interactive_snapshot(frame_tree)
+    assert find_ref(frame_interactive, "button", "close") == "f1e2"
+    assert "- [f1e2] button \"Close ad\" [cursor=pointer]" in frame_interactive
+
+    assert normalize_ref("e12") == "e12"
+    assert normalize_ref("f56e8") == "f56e8"
+    assert normalize_ref("[ref=f3e4]") == "f3e4"
+
+    frame_headline = parse_node_headline('- button "Close ad" [ref=f1e2] [cursor=pointer]')
+    assert frame_headline["ref"] == "f1e2"
+    assert frame_headline["role"] == "button"
+    assert frame_headline["name"] == "Close ad"
+
     print("interactive snapshot helpers test passed")
+
+
+async def test_snapshot_role_normalization() -> None:
+    from playwright.async_api import async_playwright
+
+    from webgent.browser import BrowserManager
+    from webgent.snapshot import capture_page_snapshot
+
+    html = (
+        "<input type='file' aria-label='Upload file'>"
+        "<input type='checkbox' aria-label='Subscribe'>"
+        "<input type='radio' name='plan' aria-label='Pro plan'>"
+    )
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(f"<html><body>{html}</body></html>")
+        tree = await capture_page_snapshot(page, snapshot_format="tree")
+        interactive = await capture_page_snapshot(page, snapshot_format="interactive")
+        file_ref = find_ref(interactive, "file", "upload")
+        assert file_ref is not None
+        checkbox_ref = find_ref(interactive, "checkbox", "subscribe")
+        radio_ref = find_ref(interactive, "radio", "pro")
+        await browser.close()
+
+    assert find_ref(interactive, "file", "upload") is not None
+    assert find_ref(interactive, "checkbox", "subscribe") is not None
+    assert find_ref(interactive, "radio", "pro") is not None
+    assert 'file "Upload file"' in tree
+    assert 'checkbox "Subscribe"' in tree
+    assert 'radio "Pro plan"' in tree
+    assert 'button "Upload file"' not in tree
+
+    manager = BrowserManager()
+    await manager.start()
+    try:
+        session_info = await manager.create_session(
+            "role-normalization-test",
+            initial_url=f"data:text/html,<html><body>{html}</body></html>",
+        )
+        session = manager.get_session(session_info["session_id"])
+        file_node = await session.get_node(file_ref)
+        checkbox_node = await session.get_node(checkbox_ref)
+        radio_node = await session.get_node(radio_ref)
+        assert file_node["role"] == "file"
+        assert checkbox_node["role"] == "checkbox"
+        assert radio_node["role"] == "radio"
+        assert 'file "Upload file"' in file_node["subtree"]
+        await manager.close_session(session_info["session_id"])
+    finally:
+        await manager.stop()
+
+    print("snapshot role normalization test passed")
+
+
+async def test_cross_frame_refs() -> None:
+    import urllib.parse
+
+    from playwright.async_api import async_playwright
+
+    from webgent.browser import BrowserManager
+    from webgent.snapshot import capture_page_snapshot, click_ref
+
+    iframe_html = (
+        "<html><body><button aria-label='Close ad'>X</button></body></html>"
+    )
+    outer_html = (
+        "<html><body>"
+        f"<iframe srcdoc=\"{iframe_html.replace('\"', '&quot;')}\"></iframe>"
+        "</body></html>"
+    )
+    page_url = "data:text/html," + urllib.parse.quote(outer_html)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(outer_html, wait_until="domcontentloaded")
+        await page.wait_for_timeout(300)
+
+        tree = await capture_page_snapshot(page, snapshot_format="tree")
+        interactive = await capture_page_snapshot(page, snapshot_format="interactive")
+        close_ref = find_ref(interactive, "button", "close")
+        assert close_ref is not None, f"missing close button in interactables:\n{interactive}"
+        assert normalize_ref(close_ref) == close_ref
+        assert "Close ad" in tree
+
+        await click_ref(page, close_ref)
+        await browser.close()
+
+    manager = BrowserManager()
+    await manager.start()
+    try:
+        session_info = await manager.create_session(
+            "cross-frame-ref-test",
+            initial_url=page_url,
+        )
+        session = manager.get_session(session_info["session_id"])
+        await asyncio.sleep(0.3)
+
+        interactables = await session.page_interactables()
+        close_ref = find_ref(interactables["interactables"], "button", "close")
+        assert close_ref is not None, interactables["interactables"]
+
+        clicked = await session.click(close_ref)
+        assert clicked["ref"] == close_ref
+
+        node = await session.get_node(close_ref)
+        assert node["role"] == "button"
+        assert node["name"] == "Close ad"
+
+        await manager.close_session(session_info["session_id"])
+    finally:
+        await manager.stop()
+
+    print("cross frame refs test passed")
 
 
 async def test_browser_manager() -> None:
@@ -288,6 +505,15 @@ async def test_browser_manager() -> None:
         full_page_result = await session.take_screenshot(full_page=True)
         assert full_page_result["mode"] == "full_page"
         assert Path(full_page_result["path"]).exists()
+
+        await session.goto(CAPTCHA_PAGE_URL)
+        captcha_interactables = await session.page_interactables()
+        captcha_ref = find_ref(captcha_interactables["interactables"], "img", "captcha")
+        assert captcha_ref is not None
+        captcha_result = await session.captcha_ocr(captcha_ref)
+        assert captcha_result["ref"] == captcha_ref
+        assert isinstance(captcha_result["text"], str)
+        assert len(captcha_result["text"]) > 0
 
         await session.goto(
             "data:text/html,<html><body>"
@@ -546,6 +772,73 @@ async def test_action_metadata_only() -> None:
         await manager.stop()
 
 
+READONLY_INPUT_PAGE_URL = (
+    "data:text/html,<html><body>"
+    "<input aria-label='Locked field' readonly value='fixed'>"
+    "</body></html>"
+)
+
+JQUERY_DATEPICKER_PAGE_URL = (
+    "data:text/html,<html><body>"
+    "<input aria-label='Date of birth' name='date_of_birth' readonly "
+    "class='hasDatepicker' value=''>"
+    "<script>"
+    "window.jQuery=function(el){const node=typeof el==='string'"
+    "?document.querySelector(el):el.nodeType?el:el[0];return{"
+    "datepicker(action,date){if(action==='setDate'&&date instanceof Date){"
+    "const d=String(date.getDate()).padStart(2,'0');"
+    "const m=String(date.getMonth()+1).padStart(2,'0');"
+    "const y=date.getFullYear();node.value=d+'-'+m+'-'+y;"
+    "node.dispatchEvent(new Event('change',{bubbles:true}));}}};};"
+    "jQuery.fn={datepicker:function(){return this;}};"
+    "jQuery.data=function(){return{settings:{dateFormat:'dd-mm-yy'}}};"
+    "</script></body></html>"
+)
+
+
+async def test_fill_verifies_dom_value() -> None:
+    manager = BrowserManager()
+    await manager.start()
+    try:
+        session_info = await manager.create_session(
+            "fill-verify-test",
+            initial_url=FORM_PAGE_URL,
+        )
+        session = manager.get_session(session_info["session_id"])
+        interactables = await session.page_interactables()
+        email_ref = find_ref(interactables["interactables"], "textbox", "email")
+        assert email_ref
+
+        filled = await session.fill_field(email_ref, "verified@example.com")
+        assert filled["value"] == "verified@example.com"
+        node = await session.get_node(email_ref)
+        assert node["value"] == "verified@example.com"
+
+        await session.goto(READONLY_INPUT_PAGE_URL)
+        readonly_interactables = await session.page_interactables()
+        locked_ref = find_ref(readonly_interactables["interactables"], "locked")
+        assert locked_ref is not None
+        try:
+            await session.fill_field(locked_ref, "should-fail")
+            raise AssertionError("fill should fail on readonly input")
+        except ValueError as exc:
+            assert "readonly" in str(exc).lower()
+
+        await session.goto(JQUERY_DATEPICKER_PAGE_URL)
+        date_interactables = await session.page_interactables()
+        dob_ref = find_ref(date_interactables["interactables"], "date", "birth")
+        assert dob_ref is not None
+        filled_dob = await session.fill_field(dob_ref, "15-06-1990")
+        assert filled_dob["value"] == "15-06-1990"
+        dob_node = await session.get_node(dob_ref)
+        assert dob_node["value"] == "15-06-1990"
+
+        await manager.close_session(session_info["session_id"])
+        print("fill verifies dom value test passed")
+    finally:
+        await manager.stop()
+
+
 def assert_request_summaries(requests: list[dict]) -> str:
     assert requests, "expected at least one captured request"
     for entry in requests:
@@ -584,6 +877,12 @@ async def test_network_capture() -> None:
         assert isinstance(req_headers["headers"], dict)
         assert req_headers["headers"]
 
+        req_body = await session.get_captured_request_body(request_id)
+        assert req_body["request_id"] == request_id
+        assert req_body["method"] == "GET"
+        assert req_body["body"] == ""
+        assert req_body["size"] == 0
+
         resp_headers = await session.get_captured_response_headers(request_id)
         assert resp_headers["request_id"] == request_id
         assert resp_headers["status"] is not None
@@ -594,6 +893,9 @@ async def test_network_capture() -> None:
         assert response["status"] is not None
         assert response["body"]
         assert response["size"] > 0
+        assert response["format"] == "tree"
+        assert "<html" not in response["body"].lower()
+        assert "[ref=" in response["body"]
 
         await session.goto(FETCH_PAGE_URL)
         interactables = await session.page_interactables()
@@ -608,6 +910,56 @@ async def test_network_capture() -> None:
         assert xhr_requests, "expected fetch/xhr request after click"
         assert xhr_requests[0]["method"] == "GET"
 
+        await session.goto(POST_FETCH_PAGE_URL)
+        post_interactables = await session.page_interactables()
+        post_ref = find_ref(post_interactables["interactables"], "button", "post data")
+        assert post_ref is not None
+        posted = await session.click(post_ref, capture_requests=True)
+        post_requests = [
+            entry
+            for entry in posted.get("requests", [])
+            if entry["resource_type"] in {"fetch", "xhr"} and entry["method"] == "POST"
+        ]
+        assert post_requests, "expected POST fetch/xhr request after click"
+        post_request_id = post_requests[0]["id"]
+        post_body = await session.get_captured_request_body(post_request_id)
+        assert post_body["request_id"] == post_request_id
+        assert post_body["method"] == "POST"
+        assert "application/json" in post_body["content_type"]
+        assert "hello" in post_body["body"]
+        assert post_body["size"] > 0
+
+        await session.goto(FORM_UPLOAD_POST_PAGE_URL)
+        upload_interactables = await session.page_interactables()
+        file_ref = find_ref(upload_interactables["interactables"], "file", "file")
+        submit_ref = find_ref(
+            upload_interactables["interactables"],
+            "button",
+            "upload submit",
+        )
+        assert file_ref is not None
+        assert submit_ref is not None
+        await session.upload_files(
+            file_ref,
+            text="uploaded file",
+            filename="payload.txt",
+        )
+        submitted = await session.click(submit_ref, capture_requests=True)
+        form_post_requests = [
+            entry
+            for entry in submitted.get("requests", [])
+            if entry["method"] == "POST" and "httpbin.org/post" in entry["url"]
+        ]
+        assert form_post_requests, "expected multipart form POST after submit"
+        form_post_id = form_post_requests[0]["id"]
+        form_post_body = await session.get_captured_request_body(form_post_id)
+        assert form_post_body["method"] == "POST"
+        assert "multipart/form-data" in form_post_body["content_type"]
+        assert 'name="field1"' in form_post_body["body"]
+        assert "hello" in form_post_body["body"]
+        assert form_post_body["size"] > 0
+        assert form_post_body.get("body_source") == "proxy"
+
         await manager.close_session(session_info["session_id"])
         try:
             manager.get_session(session_info["session_id"])
@@ -619,8 +971,208 @@ async def test_network_capture() -> None:
         await manager.stop()
 
 
+async def test_request_registry() -> None:
+    manager = BrowserManager()
+    await manager.start()
+    saved_paths: list[Path] = []
+    try:
+        session_info = await manager.create_session(
+            "registry-test",
+            initial_url="about:blank",
+        )
+        session = manager.get_session(session_info["session_id"])
+
+        captured = await session.goto(
+            "https://example.org",
+            capture_requests=True,
+        )
+        request_id = assert_request_summaries(captured["requests"])
+
+        registered = await manager.register_request(request_id)
+        assert registered["request_id"] == request_id
+        assert registered.get("already_registered") is not True
+        registry_path = Path(registered["registry_path"])
+        saved_paths.append(registry_path)
+        assert registry_path.is_dir()
+        assert (registry_path / "request_header").is_file()
+        assert (registry_path / "response_header").is_file()
+        assert (registry_path / "request_body").is_file()
+        assert (registry_path / "response").is_file()
+        raw_response = (registry_path / "response").read_text(encoding="utf-8")
+        assert "<html" in raw_response.lower()
+
+        await manager.close_session(session_info["session_id"])
+
+        response = await manager.get_captured_response(request_id)
+        assert response["registered"] is True
+        assert response["format"] == "tree"
+        assert "<html" not in response["body"].lower()
+        assert "[ref=" in response["body"]
+
+        req_headers = await manager.get_captured_request_headers(request_id)
+        assert req_headers["registered"] is True
+        assert req_headers["headers"]
+
+        resp_headers = await manager.get_captured_response_headers(request_id)
+        assert resp_headers["registered"] is True
+        assert resp_headers["headers"]
+
+        raw_response = await manager.get_captured_response(request_id, format="raw")
+        assert raw_response["format"] == "raw"
+        assert "<html" in raw_response["body"].lower()
+
+        print("request registry smoke test passed")
+    finally:
+        for path in saved_paths:
+            if path.is_dir():
+                for child in sorted(path.rglob("*"), reverse=True):
+                    if child.is_file():
+                        child.unlink()
+                for child in sorted(path.rglob("*"), reverse=True):
+                    if child.is_dir():
+                        child.rmdir()
+                path.rmdir()
+        await manager.stop()
+
+
+async def test_page_inspect_and_http_tools() -> None:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from webgent.crypto_rsa import encrypt_rsa as encrypt_rsa_fn
+
+    manager = BrowserManager()
+    await manager.start()
+    saved_paths: list[Path] = []
+    try:
+        session_info = await manager.create_session(
+            "page-inspect-test",
+            initial_url="about:blank",
+        )
+        session = manager.get_session(session_info["session_id"])
+
+        await session.goto(FORM_DATA_PAGE_URL)
+        form_data = await session.get_form_data()
+        assert form_data["csrf_token"] == "csrf-abc"
+        assert form_data["form"]["fields"]["_token"] == "tok-abc"
+        assert form_data["form"]["fields"]["email"] == ""
+
+        interactables = await session.page_interactables()
+        assert "_token" not in interactables["interactables"]
+
+        evaluated = await session.evaluate_js(
+            '() => document.querySelector("meta[name=csrf-token]").content'
+        )
+        assert evaluated["result"] == "csrf-abc"
+        assert evaluated["type"] == "str"
+
+        await session.goto("https://example.com")
+        cookies_before = await session.get_cookies()
+        assert cookies_before["count"] >= 0
+
+        await session.set_cookies(
+            [
+                {
+                    "name": "webgent_test",
+                    "value": "cookie-value",
+                    "domain": ".example.com",
+                    "path": "/",
+                }
+            ]
+        )
+        cookies_after = await session.get_cookies(urls=["https://example.com"])
+        assert any(c["name"] == "webgent_test" for c in cookies_after["cookies"])
+
+        captured = await session.goto(
+            "https://example.org",
+            capture_requests=True,
+        )
+        request_id = assert_request_summaries(captured["requests"])
+        raw = await session.get_captured_response(request_id, format="raw")
+        assert raw["format"] == "raw"
+        assert "<html" in raw["body"].lower()
+
+        http_result = await session.http_request(
+            method="POST",
+            url="https://httpbingo.org/post",
+            data={"hello": "world"},
+        )
+        assert http_result["status"] == 200
+        assert "hello" in http_result["body"]
+
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public_pem = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        ).decode("ascii")
+        ciphertext = encrypt_rsa_fn("secret", public_pem)
+        assert ciphertext
+
+        await session.goto(ENCRYPT_PAGE_URL)
+        encrypted = await session.encrypt_rsa("secret", password_mode="page")
+        assert encrypted["mode"] == "page"
+        assert encrypted["ciphertext"] == "c2VjcmV0"
+
+        await session.goto(URLENCODED_FORM_PAGE_URL)
+        submit_ref = find_ref(
+            (await session.page_interactables())["interactables"],
+            "button",
+            "submit encoded",
+        )
+        assert submit_ref is not None
+        submitted = await session.click(submit_ref, capture_requests=True)
+        post_requests = [
+            entry
+            for entry in submitted.get("requests", [])
+            if entry["method"] == "POST" and "httpbingo.org/post" in entry["url"]
+        ]
+        assert post_requests, "expected urlencoded POST"
+        post_id = post_requests[0]["id"]
+        registered = await manager.register_request(post_id)
+        saved_paths.append(Path(registered["registry_path"]))
+
+        replayed = await manager.replay_request(
+            session_info["session_id"],
+            post_id,
+            overrides={"field1": "updated"},
+            refresh_token=False,
+        )
+        assert replayed["status"] == 200
+        assert replayed["applied_fields"]["field1"] == "updated"
+        assert replayed["applied_fields"]["_token"] == "tok123"
+
+        await manager.close_session(session_info["session_id"])
+        print("page inspect and http tools smoke test passed")
+    finally:
+        for path in saved_paths:
+            if path.is_dir():
+                for child in sorted(path.rglob("*"), reverse=True):
+                    if child.is_file():
+                        child.unlink()
+                path.rmdir()
+        await manager.stop()
+
+
 async def test_mcp_tools() -> None:
     async with Client(str(SERVER_PATH)) as client:
+        prompts = await client.list_prompts()
+        prompt_names = {item.name for item in prompts}
+        assert "agent_system_prompt" in prompt_names
+
+        prompt_result = await client.get_prompt("agent_system_prompt")
+        prompt_text = prompt_result.messages[0].content.text
+        assert "interactable" in prompt_text.lower() or "interactables" in prompt_text.lower()
+
+        resources = await client.list_resources()
+        resource_uris = {resource.uri for resource in resources}
+        assert "webgent://server-info" in resource_uris
+        assert "webgent://prompt" not in resource_uris
+
+        readme_contents = await client.read_resource("webgent://server-info")
+        readme_text = readme_contents[0].text
+        assert "webgent" in readme_text.lower()
+        assert "MCP" in readme_text or "mcp" in readme_text.lower()
+
         tools = await client.list_tools()
         tool_names = {tool.name for tool in tools}
         expected = {
@@ -649,9 +1201,19 @@ async def test_mcp_tools() -> None:
             "select_tab",
             "get_url",
             "screenshot",
+            "captcha_ocr",
             "get_captured_response",
             "get_captured_request_headers",
+            "get_captured_request_body",
             "get_captured_response_headers",
+            "register_request",
+            "evaluate_js",
+            "get_form_data",
+            "get_cookies",
+            "set_cookies",
+            "http_request",
+            "encrypt_rsa",
+            "replay_request",
         }
         assert expected.issubset(tool_names), f"missing tools: {expected - tool_names}"
 
@@ -765,6 +1327,21 @@ async def test_mcp_tools() -> None:
         assert Path(result.data["path"]).exists()
         assert result.data["mode"] == "element"
         assert result.data["ref"] == button_ref
+
+        result = await client.call_tool(
+            "goto",
+            {"session_id": session_id, "url": CAPTCHA_PAGE_URL},
+        )
+        result = await client.call_tool("interactables", {"session_id": session_id})
+        captcha_ref = find_ref(result.data["interactables"], "img", "captcha")
+        assert captcha_ref is not None
+        result = await client.call_tool(
+            "captcha_ocr",
+            {"session_id": session_id, "ref": captcha_ref},
+        )
+        assert result.data["ref"] == captcha_ref
+        assert isinstance(result.data["text"], str)
+        assert len(result.data["text"]) > 0
 
         result = await client.call_tool(
             "goto",
@@ -924,19 +1501,26 @@ async def test_mcp_tools() -> None:
 
         result = await client.call_tool(
             "get_captured_request_headers",
-            {"session_id": session_id, "request_id": request_id},
+            {"request_id": request_id},
         )
         assert result.data["headers"]
 
         result = await client.call_tool(
+            "get_captured_request_body",
+            {"request_id": request_id},
+        )
+        assert "body" in result.data
+        assert result.data["size"] == 0
+
+        result = await client.call_tool(
             "get_captured_response_headers",
-            {"session_id": session_id, "request_id": request_id},
+            {"request_id": request_id},
         )
         assert result.data["headers"]
 
         result = await client.call_tool(
             "get_captured_response",
-            {"session_id": session_id, "request_id": request_id},
+            {"request_id": request_id},
         )
         assert result.data["body"]
 
@@ -951,9 +1535,14 @@ async def test_mcp_tools() -> None:
 async def main() -> None:
     test_compress_snapshot_helpers()
     test_interactive_snapshot_helpers()
+    await test_snapshot_role_normalization()
+    await test_cross_frame_refs()
     await test_browser_manager()
     await test_action_metadata_only()
+    await test_fill_verifies_dom_value()
     await test_network_capture()
+    await test_request_registry()
+    await test_page_inspect_and_http_tools()
     await test_mcp_tools()
 
 

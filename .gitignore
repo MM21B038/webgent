@@ -16,3 +16,10 @@ profile/*
 # Saved screenshots and media
 media/*
 !media/.gitkeep
+
+# Persisted network request registry
+registry/*
+!registry/.gitkeep
+
+# mitmproxy CA and config
+mitmproxy/

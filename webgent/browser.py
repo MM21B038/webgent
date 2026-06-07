@@ -4,10 +4,12 @@ import asyncio
 import re
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
-from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
+from webgent.captcha_ocr import recognize_captcha
+from webgent.cdp_post_data import CdpPostDataCapture
 from webgent.config import PROFILE_DIR, get_settings
 from webgent.files import resolve_upload_files
 from webgent.page_state import PageSnapshotState
@@ -17,12 +19,32 @@ from webgent.network_capture import (
     ActionNetworkCapture,
     NetworkCaptureStore,
 )
+from webgent.proxy_capture import (
+    ProxyCaptureServer,
+    ProxyCaptureStore,
+    playwright_proxy_options,
+)
+from webgent.request_body import resolve_request_body, resolve_response_body
+from webgent.crypto_rsa import encrypt_rsa as encrypt_rsa_text
+from webgent.crypto_rsa import encrypt_via_page
+from webgent.http_client import http_request as send_http_request
+from webgent.page_inspect import (
+    evaluate_js as run_evaluate_js,
+    get_cookies as read_cookies,
+    get_form_data as read_form_data,
+    set_cookies as write_cookies,
+)
+from webgent.replay import replay_request as run_replay_request
+from webgent.request_registry import RequestRegistry, decode_body_bytes
 from webgent.snapshot import (
     DEFAULT_GET_NODE_DEPTH,
     DEFAULT_MAX_URL_LEN,
+    capture_html_snapshot,
     click_ref,
+    fill_ref,
     get_node_result,
     interactables_result,
+    is_html_content_type,
     normalize_ref,
     read_locator_value,
     read_page_signals,
@@ -66,24 +88,47 @@ async def page_info(page: Page, page_id: str, is_active: bool) -> dict[str, Any]
 class ProfileBrowser:
     """One persistent Chromium context per profile; shared by multiple sessions."""
 
-    def __init__(self, profile_name: str, context: BrowserContext) -> None:
+    def __init__(
+        self,
+        profile_name: str,
+        context: BrowserContext,
+        *,
+        proxy_capture: ProxyCaptureStore | None = None,
+    ) -> None:
         self.profile_name = profile_name
         self.context = context
         self._sessions: dict[str, BrowserSession] = {}
         self._context_listener_installed = False
         self._closed = False
+        self._cdp_post_data = CdpPostDataCapture()
+        self._proxy_capture = proxy_capture
 
     @classmethod
-    async def launch(cls, playwright: Playwright, profile_name: str) -> ProfileBrowser:
+    async def launch(
+        cls,
+        playwright: Playwright,
+        profile_name: str,
+        *,
+        launch_extras: dict[str, Any] | None = None,
+        proxy_capture: ProxyCaptureStore | None = None,
+    ) -> ProfileBrowser:
         safe_name = sanitize_profile_name(profile_name)
         user_data_dir = profile_path(safe_name)
-        context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            headless=get_settings().browser.headless,
-            no_viewport=True,
-        )
-        profile = cls(safe_name, context)
+        launch_kwargs: dict[str, Any] = {
+            "user_data_dir": user_data_dir,
+            "headless": get_settings().browser.headless,
+            "no_viewport": True,
+        }
+        if launch_extras:
+            launch_kwargs.update(launch_extras)
+        context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
+        profile = cls(safe_name, context, proxy_capture=proxy_capture)
         profile._install_context_listener()
+        if context.pages:
+            install_page = context.pages[0]
+        else:
+            install_page = await context.new_page()
+        await profile._cdp_post_data.install(context, install_page)
         return profile
 
     def register_session(self, session: BrowserSession) -> None:
@@ -108,7 +153,7 @@ class ProfileBrowser:
 
     async def _route_new_page(self, page: Page) -> None:
         for session in self._sessions.values():
-            if session._page_belongs_to_session(page):
+            if await session._page_belongs_to_session(page):
                 await session._handle_new_page(page)
                 return
 
@@ -116,7 +161,10 @@ class ProfileBrowser:
         if self._closed:
             return
         self._closed = True
-        await self.context.close()
+        try:
+            await self.context.close()
+        except Exception:
+            pass
 
 
 class BrowserSession:
@@ -127,6 +175,9 @@ class BrowserSession:
         context: BrowserContext,
         pages: dict[str, Page],
         active_page_id: str,
+        *,
+        cdp_post_data: CdpPostDataCapture,
+        proxy_capture: ProxyCaptureStore | None,
     ) -> None:
         self.session_id = session_id
         self.profile_name = profile_name
@@ -135,6 +186,8 @@ class BrowserSession:
         self.active_page_id = active_page_id
         self._page_states: dict[str, PageSnapshotState] = {}
         self._network_store = NetworkCaptureStore()
+        self._cdp_post_data = cdp_post_data
+        self._proxy_capture = proxy_capture
 
     @classmethod
     async def create(
@@ -168,6 +221,8 @@ class BrowserSession:
             context=profile.context,
             pages=pages,
             active_page_id=active_page_id,
+            cdp_post_data=profile._cdp_post_data,
+            proxy_capture=profile._proxy_capture,
         )
         for page in pages.values():
             session._attach_page_close_listener(page)
@@ -196,8 +251,8 @@ class BrowserSession:
             self.active_page_id = page_id
         return page_id
 
-    def _page_belongs_to_session(self, page: Page) -> bool:
-        opener = page.opener
+    async def _page_belongs_to_session(self, page: Page) -> bool:
+        opener = await page.opener()
         if opener is None:
             return False
         return self._find_page_id(opener) is not None
@@ -236,21 +291,43 @@ class BrowserSession:
             except Exception:
                 pass
 
-    async def _adopt_new_pages(self, *, activate: bool = True) -> str | None:
+    async def _should_adopt_page(
+        self,
+        page: Page,
+        *,
+        pages_before: frozenset[Page] | None = None,
+    ) -> bool:
+        if await self._page_belongs_to_session(page):
+            return True
+        # target=_blank cross-origin popups often lose opener metadata.
+        if pages_before is None or page in pages_before:
+            return False
+        return await page.opener() is None
+
+    async def _adopt_new_pages(
+        self,
+        *,
+        activate: bool = True,
+        pages_before: frozenset[Page] | None = None,
+    ) -> str | None:
         new_page_id: str | None = None
         for _ in range(40):
-            unregistered = [
-                p
-                for p in self.context.pages
-                if self._find_page_id(p) is None and self._page_belongs_to_session(p)
-            ]
+            unregistered = []
+            for candidate in self.context.pages:
+                if self._find_page_id(candidate) is not None:
+                    continue
+                if await self._should_adopt_page(
+                    candidate,
+                    pages_before=pages_before,
+                ):
+                    unregistered.append(candidate)
             if unregistered:
                 break
             await asyncio.sleep(0.05)
         for page in self.context.pages:
             if self._find_page_id(page) is not None:
                 continue
-            if not self._page_belongs_to_session(page):
+            if not await self._should_adopt_page(page, pages_before=pages_before):
                 continue
             new_page_id = self._register_page(page, activate=False)
             await self._ensure_page_state(new_page_id)
@@ -265,18 +342,45 @@ class BrowserSession:
             await self.pages[new_page_id].bring_to_front()
         return new_page_id
 
+    async def _has_pending_popup_pages(
+        self,
+        *,
+        pages_before: frozenset[Page] | None = None,
+    ) -> bool:
+        for page in self.context.pages:
+            if self._find_page_id(page) is not None:
+                continue
+            if await self._should_adopt_page(page, pages_before=pages_before):
+                return True
+        return False
+
     async def _finalize_action_page(
         self,
         acted_page_id: str,
         acted_page: Page,
+        *,
+        pages_before: frozenset[Page] | None = None,
     ) -> tuple[Page, str, dict[str, Any]]:
         meta: dict[str, Any] = {"opened_new_page": False}
-        await self._adopt_new_pages(activate=True)
+        for _ in range(60):
+            await self._adopt_new_pages(
+                activate=True,
+                pages_before=pages_before,
+            )
+            if self.active_page_id != acted_page_id:
+                break
+            if not await self._has_pending_popup_pages(pages_before=pages_before):
+                break
+            await asyncio.sleep(0.05)
         active_page_id = self.active_page_id
         active_page = self.pages[active_page_id]
         if active_page_id != acted_page_id:
             meta["opened_new_page"] = True
             meta["previous_page_id"] = acted_page_id
+        try:
+            await active_page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
         await self._sync_page_state(active_page_id)
         meta["active_page_id"] = active_page_id
         return active_page, active_page_id, meta
@@ -316,7 +420,12 @@ class BrowserSession:
     ) -> tuple[_T, list[dict[str, Any]] | None]:
         if not capture_requests:
             return await action(), None
-        async with ActionNetworkCapture(self._network_store, self) as capture:
+        async with ActionNetworkCapture(
+            self._network_store,
+            self,
+            cdp_post_data=self._cdp_post_data,
+            proxy_capture=self._proxy_capture,
+        ) as capture:
             result = await action()
         return result, self._network_store.summaries(
             capture.captured_ids,
@@ -346,8 +455,13 @@ class BrowserSession:
         await resolve_ref_locator(page, acted_ref)
 
         async def do_action() -> tuple[Page, str, dict[str, Any]]:
+            pages_before = frozenset(self.context.pages)
             await action_fn(page)
-            return await self._finalize_action_page(resolved_page_id, page)
+            return await self._finalize_action_page(
+                resolved_page_id,
+                page,
+                pages_before=pages_before,
+            )
 
         (active_page, active_page_id, page_meta), requests = (
             await self._with_optional_capture(
@@ -526,33 +640,38 @@ class BrowserSession:
         request_id: str,
         *,
         max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        format: Literal["tree", "raw"] = "tree",
     ) -> dict[str, Any]:
         entry = self._network_store.get(request_id)
         if entry._response is None:
             raise ValueError(f"No response available for request_id: {request_id}")
-        try:
-            body_bytes = await entry._response.body()
-        except Exception as exc:
-            raise ValueError(
-                f"Could not read response body for request_id: {request_id}"
-            ) from exc
-        full_size = len(body_bytes)
-        truncated = full_size > max_bytes
-        if truncated:
-            body_bytes = body_bytes[:max_bytes]
-        try:
-            body = body_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            body = body_bytes.decode("utf-8", errors="replace")
+        body_bytes, body_source = await resolve_response_body(
+            entry,
+            self._proxy_capture,
+        )
+        body, full_size, truncated = decode_body_bytes(
+            body_bytes,
+            max_bytes=max_bytes,
+        )
+        content_type = entry._response.headers.get("content-type", "")
         result: dict[str, Any] = {
             "request_id": request_id,
             "status": entry.status,
-            "content_type": entry._response.headers.get("content-type", ""),
+            "content_type": content_type,
             "body": body,
             "size": full_size,
+            "body_source": body_source,
         }
         if truncated:
             result["truncated"] = True
+        if is_html_content_type(content_type) and format == "tree":
+            try:
+                result["body"] = await capture_html_snapshot(self.context, body)
+                result["format"] = "tree"
+            except Exception:
+                result["format"] = "raw"
+        else:
+            result["format"] = "raw"
         return result
 
     async def get_captured_request_headers(
@@ -567,6 +686,38 @@ class BrowserSession:
                 f"Could not read request headers for request_id: {request_id}"
             ) from exc
         return {"request_id": request_id, "headers": headers}
+
+    async def get_captured_request_body(
+        self,
+        request_id: str,
+        *,
+        max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    ) -> dict[str, Any]:
+        entry = self._network_store.get(request_id)
+        body_bytes, body_source = await resolve_request_body(
+            entry,
+            self._proxy_capture,
+            self._cdp_post_data,
+        )
+        body, full_size, truncated = decode_body_bytes(
+            body_bytes,
+            max_bytes=max_bytes,
+        )
+        result: dict[str, Any] = {
+            "request_id": request_id,
+            "method": entry.method,
+            "content_type": entry._request.headers.get("content-type", ""),
+            "body": body,
+            "size": full_size,
+            "body_source": body_source,
+        }
+        if truncated:
+            result["truncated"] = True
+        if self._proxy_capture is not None and self._proxy_capture.request_was_truncated(
+            request_id
+        ):
+            result["proxy_truncated"] = True
+        return result
 
     async def get_captured_response_headers(
         self,
@@ -730,11 +881,11 @@ class BrowserSession:
             if slowly:
                 await locator.press_sequentially(text)
             else:
-                await locator.fill(text)
+                await fill_ref(locator, text)
             if submit:
                 await locator.press("Enter")
 
-        return await self._run_action(
+        result = await self._run_action(
             ref,
             action,
             page_id,
@@ -744,6 +895,9 @@ class BrowserSession:
             submit=submit,
             slowly=slowly,
         )
+        page, _ = self._resolve_page(result["page_id"])
+        result["value"] = await read_locator_value(ref_locator(page, ref))
+        return result
 
     async def fill_field(
         self,
@@ -754,14 +908,19 @@ class BrowserSession:
         capture_requests: bool = False,
         max_url_len: int = DEFAULT_MAX_URL_LEN,
     ) -> dict[str, Any]:
-        return await self._run_action(
+        async def action(page: Page) -> None:
+            await fill_ref(ref_locator(page, ref), value)
+
+        result = await self._run_action(
             ref,
-            lambda page: ref_locator(page, ref).fill(value),
+            action,
             page_id,
             capture_requests=capture_requests,
             max_url_len=max_url_len,
-            value=value,
         )
+        page, _ = self._resolve_page(result["page_id"])
+        result["value"] = await read_locator_value(ref_locator(page, ref))
+        return result
 
     async def select_option(
         self,
@@ -868,7 +1027,7 @@ class BrowserSession:
         max_url_len: int = DEFAULT_MAX_URL_LEN,
     ) -> dict[str, Any]:
         async def action(page: Page) -> None:
-            await ref_locator(page, ref).fill(str(value))
+            await fill_ref(ref_locator(page, ref), str(value))
 
         result = await self._run_action(
             ref,
@@ -909,7 +1068,7 @@ class BrowserSession:
         max_url_len: int = DEFAULT_MAX_URL_LEN,
     ) -> dict[str, Any]:
         async def action(page: Page) -> None:
-            await ref_locator(page, ref).fill(str(value))
+            await fill_ref(ref_locator(page, ref), str(value))
 
         result = await self._run_action(
             ref,
@@ -937,6 +1096,107 @@ class BrowserSession:
             capture_requests=capture_requests,
             max_url_len=max_url_len,
         )
+
+    async def evaluate_js(
+        self,
+        expression: str,
+        page_id: str | None = None,
+        *,
+        arg: Any = None,
+    ) -> dict[str, Any]:
+        page, resolved_page_id = self._resolve_page(page_id)
+        result = await run_evaluate_js(page, expression, arg)
+        return {
+            "page_id": resolved_page_id,
+            "url": page.url,
+            "title": await page.title(),
+            **result,
+        }
+
+    async def get_form_data(
+        self,
+        page_id: str | None = None,
+        *,
+        form_index: int = 0,
+    ) -> dict[str, Any]:
+        page, resolved_page_id = self._resolve_page(page_id)
+        result = await read_form_data(page, form_index=form_index)
+        return {
+            "page_id": resolved_page_id,
+            "url": page.url,
+            "title": await page.title(),
+            **result,
+        }
+
+    async def get_cookies(
+        self,
+        *,
+        urls: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return await read_cookies(self.context, urls=urls)
+
+    async def set_cookies(
+        self,
+        cookies: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return await write_cookies(self.context, cookies)
+
+    async def http_request(
+        self,
+        *,
+        method: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        body: str | None = None,
+        data: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+        content_type: str | None = None,
+        max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        format: Literal["tree", "raw"] = "tree",
+    ) -> dict[str, Any]:
+        page, resolved_page_id = self._resolve_page(None)
+        result = await send_http_request(
+            self.context,
+            method=method,
+            url=url,
+            headers=headers,
+            body=body,
+            data=data,
+            json_body=json_body,
+            content_type=content_type,
+            max_bytes=max_bytes,
+            format=format,
+        )
+        return {
+            "page_id": resolved_page_id,
+            "url": page.url,
+            "title": await page.title(),
+            **result,
+        }
+
+    async def encrypt_rsa(
+        self,
+        plaintext: str,
+        *,
+        public_key: str | None = None,
+        page_id: str | None = None,
+        password_mode: Literal["page", "rsa"] = "page",
+        expression: str | None = None,
+    ) -> dict[str, Any]:
+        page, resolved_page_id = self._resolve_page(page_id)
+        if password_mode == "rsa":
+            ciphertext = encrypt_rsa_text(plaintext, public_key or "")
+            mode = "rsa"
+        else:
+            ciphertext = await encrypt_via_page(page, plaintext, expression=expression)
+            mode = "page"
+        return {
+            "page_id": resolved_page_id,
+            "url": page.url,
+            "title": await page.title(),
+            "ciphertext": ciphertext,
+            "mode": mode,
+        }
 
     async def take_screenshot(
         self,
@@ -973,16 +1233,52 @@ class BrowserSession:
             image_type=image_type,  # type: ignore[arg-type]
         )
 
+    async def captcha_ocr(
+        self,
+        ref: str,
+        page_id: str | None = None,
+        *,
+        beta: bool = False,
+        png_fix: bool = False,
+    ) -> dict[str, Any]:
+        page, resolved_page_id = self._resolve_page(page_id)
+        locator = await resolve_ref_locator(page, ref)
+        image_data = await locator.screenshot(type="png")
+        text = await recognize_captcha(image_data, beta=beta, png_fix=png_fix)
+        return {
+            "page_id": resolved_page_id,
+            "url": page.url,
+            "title": await page.title(),
+            "ref": normalize_ref(ref),
+            "text": text,
+        }
+
 
 class BrowserManager:
     def __init__(self) -> None:
         self._playwright: Playwright | None = None
         self._profiles: dict[str, ProfileBrowser] = {}
         self._sessions: dict[str, BrowserSession] = {}
+        self._registry = RequestRegistry()
+        proxy_settings = get_settings().proxy
+        self._proxy_store = ProxyCaptureStore(
+            max_body_bytes=proxy_settings.max_body_bytes,
+        )
+        self._proxy_server = ProxyCaptureServer(proxy_settings, self._proxy_store)
+        self._transform_browser: Browser | None = None
+        self._transform_context: BrowserContext | None = None
+
+    def _proxy_launch_extras(self) -> dict[str, Any] | None:
+        settings = get_settings().proxy
+        if not settings.enabled:
+            return None
+        return playwright_proxy_options(settings, self._proxy_server.proxy_server_url)
 
     async def start(self) -> None:
         if self._playwright is None:
             self._playwright = await async_playwright().start()
+        if get_settings().proxy.enabled and get_settings().proxy.mode == "embedded":
+            self._proxy_server.start()
 
     async def stop(self) -> None:
         for session in list(self._sessions.values()):
@@ -991,6 +1287,8 @@ class BrowserManager:
         for profile in list(self._profiles.values()):
             await profile.close()
         self._profiles.clear()
+        await self._close_transform_context()
+        self._proxy_server.stop()
         if self._playwright is not None:
             await self._playwright.stop()
             self._playwright = None
@@ -1000,6 +1298,156 @@ class BrowserManager:
         if session is None:
             raise ValueError(f"Unknown session_id: {session_id}")
         return session
+
+    def _find_session_with_request(self, request_id: str) -> BrowserSession | None:
+        for session in self._sessions.values():
+            if session._network_store.try_get(request_id) is not None:
+                return session
+        return None
+
+    def _any_context(self) -> BrowserContext | None:
+        for session in self._sessions.values():
+            return session.context
+        for profile in self._profiles.values():
+            if profile.is_alive():
+                return profile.context
+        return None
+
+    async def _close_transform_context(self) -> None:
+        context = self._transform_context
+        browser = self._transform_browser
+        self._transform_context = None
+        self._transform_browser = None
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    async def _registry_context(self) -> BrowserContext | None:
+        context = self._any_context()
+        if context is not None:
+            return context
+        if self._playwright is None:
+            return None
+        if self._transform_context is None:
+            self._transform_browser = await self._playwright.chromium.launch(
+                headless=True,
+            )
+            self._transform_context = await self._transform_browser.new_context()
+        return self._transform_context
+
+    async def register_request(self, request_id: str) -> dict[str, Any]:
+        if self._registry.exists(request_id):
+            meta = self._registry.load_meta(request_id)
+            return {
+                "request_id": request_id,
+                "registry_path": str(self._registry.entry_dir(request_id)),
+                "method": meta.get("method"),
+                "url": meta.get("url"),
+                "status": meta.get("status"),
+                "has_response": meta.get("has_response"),
+                "already_registered": True,
+            }
+        session = self._find_session_with_request(request_id)
+        if session is None:
+            raise ValueError(f"Unknown request_id: {request_id}")
+        return await self._registry.save_from_capture(
+            session._network_store.get(request_id),
+            cdp_post_data=session._cdp_post_data,
+            proxy_capture=session._proxy_capture,
+        )
+
+    async def get_captured_response(
+        self,
+        request_id: str,
+        *,
+        max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        format: Literal["tree", "raw"] = "tree",
+    ) -> dict[str, Any]:
+        if self._registry.exists(request_id):
+            return await self._registry.get_response(
+                request_id,
+                await self._registry_context(),
+                max_bytes=max_bytes,
+                format=format,
+            )
+        session = self._find_session_with_request(request_id)
+        if session is not None:
+            return await session.get_captured_response(
+                request_id,
+                max_bytes=max_bytes,
+                format=format,
+            )
+        raise ValueError(f"Unknown request_id: {request_id}")
+
+    async def replay_request(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        overrides: dict[str, str] | None = None,
+        refresh_token: bool = False,
+        refresh_url: str | None = None,
+        encrypt_password: bool = False,
+        password_mode: Literal["page", "rsa"] = "page",
+        public_key: str | None = None,
+        expression: str | None = None,
+        max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        format: Literal["tree", "raw"] = "tree",
+    ) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        return await run_replay_request(
+            session,
+            self._registry,
+            request_id,
+            overrides=overrides,
+            refresh_token=refresh_token,
+            refresh_url=refresh_url,
+            encrypt_password=encrypt_password,
+            password_mode=password_mode,
+            public_key=public_key,
+            expression=expression,
+            max_bytes=max_bytes,
+            format=format,
+        )
+
+    async def get_captured_request_headers(self, request_id: str) -> dict[str, Any]:
+        if self._registry.exists(request_id):
+            return self._registry.get_request_headers(request_id)
+        session = self._find_session_with_request(request_id)
+        if session is not None:
+            return await session.get_captured_request_headers(request_id)
+        raise ValueError(f"Unknown request_id: {request_id}")
+
+    async def get_captured_request_body(
+        self,
+        request_id: str,
+        *,
+        max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    ) -> dict[str, Any]:
+        if self._registry.exists(request_id):
+            return self._registry.get_request_body(request_id, max_bytes=max_bytes)
+        session = self._find_session_with_request(request_id)
+        if session is not None:
+            return await session.get_captured_request_body(
+                request_id,
+                max_bytes=max_bytes,
+            )
+        raise ValueError(f"Unknown request_id: {request_id}")
+
+    async def get_captured_response_headers(self, request_id: str) -> dict[str, Any]:
+        if self._registry.exists(request_id):
+            return self._registry.get_response_headers(request_id)
+        session = self._find_session_with_request(request_id)
+        if session is not None:
+            return await session.get_captured_response_headers(request_id)
+        raise ValueError(f"Unknown request_id: {request_id}")
 
     async def create_session(
         self,
@@ -1017,7 +1465,12 @@ class BrowserManager:
             profile = None
             adopt_restored_pages = True
         if profile is None:
-            profile = await ProfileBrowser.launch(self._playwright, safe_name)
+            profile = await ProfileBrowser.launch(
+                self._playwright,
+                safe_name,
+                launch_extras=self._proxy_launch_extras(),
+                proxy_capture=self._proxy_store,
+            )
             self._profiles[safe_name] = profile
         try:
             session = await BrowserSession.create(
@@ -1029,7 +1482,12 @@ class BrowserManager:
             if type(exc).__name__ != "TargetClosedError":
                 raise
             self._drop_profile(safe_name)
-            profile = await ProfileBrowser.launch(self._playwright, safe_name)
+            profile = await ProfileBrowser.launch(
+                self._playwright,
+                safe_name,
+                launch_extras=self._proxy_launch_extras(),
+                proxy_capture=self._proxy_store,
+            )
             self._profiles[safe_name] = profile
             session = await BrowserSession.create(
                 profile,

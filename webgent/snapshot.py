@@ -1,26 +1,33 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
-from playwright.async_api import Locator, Page
+from playwright.async_api import BrowserContext, Locator, Page
 
-_REF_RE = re.compile(r"^e\d+$")
-_REF_IN_LINE_RE = re.compile(r"\[ref=(e\d+)\]")
+# Playwright aria snapshots use eN on the main frame and fNeM for cross-frame refs.
+_ARIA_REF = r"(?:f\d+)?e\d+"
+_REF_RE = re.compile(rf"^{_ARIA_REF}$")
+_REF_IN_LINE_RE = re.compile(rf"\[ref=({_ARIA_REF})\]")
 _URL_LINE_RE = re.compile(r"^(\s*-\s*/url:\s*)(.+)$")
 DEFAULT_MAX_URL_LEN = 80
 DEFAULT_GET_NODE_DEPTH = 3
+DEFAULT_CLICK_TIMEOUT_MS = 10_000
 SnapshotFormat = Literal["interactive", "tree"]
 _TREE_REF_LINE_RE = re.compile(
-    r"^(\s*)- (.+?) \[ref=(e\d+)\](.*?)(?::\s*)?$"
+    rf"^(\s*)- (.+?) \[ref=({_ARIA_REF})\](.*?)(?::\s*)?$"
 )
-_COMPACT_REF_LINE_RE = re.compile(r"^(\s*)- \[(e\d+)\]\s+")
+_COMPACT_REF_LINE_RE = re.compile(rf"^(\s*)- \[({_ARIA_REF})\]\s+")
 _ROLE_NAME_RE = re.compile(r'^(\S+)\s+"([^"]*)"(.*)$')
 _CHILD_OPTION_RE = re.compile(r'^(\s*)- option "([^"]*)"(.*)$')
 _CHILD_OPTION_QUOTED_RE = re.compile(r"""^(\s*)- 'option "([^"]*)"'(.*)$""")
 _CHILD_OPTION_REF_RE = re.compile(
-    r'^(\s*)- option "([^"]*)" \[ref=(e\d+)\](.*?)(?::\s*)?$'
+    rf'^(\s*)- option "([^"]*)" \[ref=({_ARIA_REF})\](.*?)(?::\s*)?$'
 )
+_IFRAME_REF_LINE_RE = re.compile(rf"^(\s*)- iframe\b.*\[ref=({_ARIA_REF})\]")
+SNAPSHOT_IFRAME_RETRY_COUNT = 2
+SNAPSHOT_IFRAME_RETRY_DELAY_S = 0.5
 _OPTION_CONTAINER_ROLES = frozenset({"combobox", "listbox"})
 _FORM_CONTROL_STATE_RE = re.compile(
     r"\[(checked|unchecked|selected|pressed|expanded|collapsed|disabled|required|invalid|readonly)\]"
@@ -307,8 +314,30 @@ _RESOLVE_INTERACTABLE_ROLE_JS = """(el) => {
         if (type === 'range') return 'slider';
         if (type === 'number') return 'spinbutton';
         if (type === 'search') return 'searchbox';
-        if (type === 'button' || type === 'submit' || type === 'reset') return 'button';
+        if (
+            type === 'button'
+            || type === 'submit'
+            || type === 'reset'
+            || type === 'image'
+        ) {
+            return 'button';
+        }
         if (type === 'hidden') return null;
+        if (
+            type === 'text'
+            || type === 'password'
+            || type === 'email'
+            || type === 'tel'
+            || type === 'url'
+            || type === 'date'
+            || type === 'time'
+            || type === 'datetime-local'
+            || type === 'month'
+            || type === 'week'
+            || type === 'color'
+        ) {
+            return 'textbox';
+        }
         return 'textbox';
     }
     if (tag === 'SELECT') return 'combobox';
@@ -326,6 +355,37 @@ _RESOLVE_INTERACTABLE_ROLE_JS = """(el) => {
 }"""
 
 
+async def _resolve_interactable_role(page: Page, ref: str) -> str | None:
+    try:
+        resolved = await ref_locator(page, ref).evaluate(_RESOLVE_INTERACTABLE_ROLE_JS)
+    except Exception:
+        return None
+    if not resolved:
+        return None
+    return normalize_interactive_role(resolved)
+
+
+def _rebuild_tree_ref_line(
+    indent: str,
+    role: str,
+    name: str | None,
+    ref: str,
+    suffix: str,
+    *,
+    trailing_colon: bool = False,
+) -> str:
+    if name:
+        body = f'{role} "{name}"'
+    else:
+        body = role
+    line = f"{indent}- {body} [ref={ref}]"
+    if suffix:
+        line += suffix
+    if trailing_colon:
+        line += ":"
+    return line
+
+
 def normalize_ref(ref: str) -> str:
     value = ref.strip()
     if value.startswith("[ref=") and value.endswith("]"):
@@ -334,7 +394,8 @@ def normalize_ref(ref: str) -> str:
         value = value[4:]
     if not _REF_RE.match(value):
         raise ValueError(
-            f"Invalid ref {ref!r}. Use a ref from the latest snapshot, e.g. e12."
+            f"Invalid ref {ref!r}. Use a ref from the latest snapshot, "
+            "e.g. e12 or f3e4."
         )
     return value
 
@@ -368,7 +429,137 @@ async def read_locator_value(locator: Locator) -> str:
             return value
     except Exception:
         pass
-    return str(await locator.evaluate("el => el.value ?? ''"))
+    try:
+        content = await locator.text_content()
+        if content:
+            return content
+    except Exception:
+        pass
+    return str(await locator.evaluate("el => el.value ?? el.textContent ?? ''"))
+
+
+_SYNC_INPUT_VALUE_JS = """(el, val) => {
+    if (el.isContentEditable) {
+        el.textContent = val;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return;
+    }
+    const proto = el instanceof HTMLTextAreaElement
+        ? HTMLTextAreaElement.prototype
+        : el instanceof HTMLInputElement
+        ? HTMLInputElement.prototype
+        : null;
+    if (!proto) return;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(el, val);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+}"""
+
+_DETECT_FILL_STATE_JS = """(el) => ({
+    readonly: Boolean(el.readOnly || el.getAttribute("readonly") !== null),
+    disabled: Boolean(el.disabled),
+    inputType: (el.type || "").toLowerCase(),
+    jqueryDatepicker: el.classList.contains("hasDatepicker")
+        && !!(window.jQuery?.fn?.datepicker),
+    flatpickr: !!(el._flatpickr),
+    nativeDate: el.tagName === "INPUT"
+        && (el.type === "date" || el.type === "datetime-local"),
+})"""
+
+_SET_DATEPICKER_VALUE_JS = """(el, val) => {
+    const text = String(val ?? "").trim();
+    if (!text) return "";
+
+    const parseDateValue = (input) => {
+        let match = input.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);
+        if (match) {
+            return new Date(+match[1], +match[2] - 1, +match[3]);
+        }
+        match = input.match(/^(\\d{1,2})[-\\/](\\d{1,2})[-\\/](\\d{2,4})$/);
+        if (match) {
+            let year = +match[3];
+            if (year < 100) {
+                year += year > 50 ? 1900 : 2000;
+            }
+            return new Date(year, +match[2] - 1, +match[1]);
+        }
+        const parsed = new Date(input);
+        return Number.isNaN(parsed.getTime()) ? null : parsed;
+    };
+
+    const formatIsoDate = (date) => {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, "0");
+        const day = String(date.getDate()).padStart(2, "0");
+        return `${year}-${month}-${day}`;
+    };
+
+    const date = parseDateValue(text);
+    if (!date) return "";
+
+    if (el.classList.contains("hasDatepicker") && window.jQuery?.fn?.datepicker) {
+        window.jQuery(el).datepicker("setDate", date);
+        return el.value || "";
+    }
+
+    if (el._flatpickr) {
+        el._flatpickr.setDate(date, true);
+        return el.value || "";
+    }
+
+    if (el.type === "date" || el.type === "datetime-local") {
+        const setter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype,
+            "value"
+        )?.set;
+        const iso = formatIsoDate(date);
+        setter?.call(el, iso);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return el.value || "";
+    }
+
+    return "";
+}"""
+
+
+async def fill_ref(locator: Locator, value: str) -> str:
+    state = await locator.evaluate(_DETECT_FILL_STATE_JS)
+    if state.get("disabled"):
+        raise ValueError("Fill failed: element is disabled.")
+
+    is_datepicker = (
+        state.get("jqueryDatepicker")
+        or state.get("flatpickr")
+        or state.get("nativeDate")
+    )
+    if state.get("readonly") and is_datepicker:
+        actual = await locator.evaluate(_SET_DATEPICKER_VALUE_JS, value)
+        if not actual:
+            raise ValueError(
+                f"Fill failed: could not set date {value!r}. "
+                "Use dd-mm-yyyy or yyyy-mm-dd."
+            )
+        return actual
+    if state.get("readonly"):
+        raise ValueError(
+            "Fill failed: element is readonly. "
+            "If this is a date field, use fill with dd-mm-yyyy (e.g. 15-06-1990)."
+        )
+
+    await locator.fill(value)
+    actual = await read_locator_value(locator)
+    if actual != value:
+        await locator.evaluate(_SYNC_INPUT_VALUE_JS, value)
+        actual = await read_locator_value(locator)
+    if actual != value:
+        raise ValueError(
+            f"Fill failed: expected {value!r}, got {actual!r}. "
+            "The element may be readonly, disabled, or not an editable input."
+        )
+    return actual
 
 
 def _click_intercepted(exc: BaseException) -> bool:
@@ -376,9 +567,14 @@ def _click_intercepted(exc: BaseException) -> bool:
 
 
 async def click_ref(page: Page, ref: str) -> None:
-    locator = await resolve_ref_locator(page, ref)
+    # Ref is validated in BrowserSession._run_action before this runs.
+    locator = ref_locator(page, ref)
+    click_kwargs = {
+        "no_wait_after": True,
+        "timeout": DEFAULT_CLICK_TIMEOUT_MS,
+    }
     try:
-        await locator.click()
+        await locator.click(**click_kwargs)
     except Exception as exc:
         if not _click_intercepted(exc):
             raise
@@ -394,7 +590,7 @@ async def click_ref(page: Page, ref: str) -> None:
             }"""
         )
         if not clicked_overlay:
-            await locator.click(force=True)
+            await locator.click(force=True, **click_kwargs)
 
 
 def extract_ref_from_line(line: str) -> str | None:
@@ -558,40 +754,72 @@ def apply_snapshot_format(tree_yaml: str, snapshot_format: SnapshotFormat) -> st
     return to_interactive_snapshot(tree_yaml)
 
 
+def _extract_state_tokens(line: str) -> list[str]:
+    states: list[str] = []
+    for token_match in re.finditer(r"\[([^\]=]+(?:=[^\]]+)?)\]", line):
+        token = token_match.group(1)
+        if token.startswith("ref=") or _REF_RE.fullmatch(token):
+            continue
+        states.append(token)
+    return states
+
+
 def parse_node_headline(line: str) -> dict[str, Any]:
+    stripped = line.rstrip()
+    tree_match = _TREE_REF_LINE_RE.match(stripped)
+    if tree_match is not None:
+        body = tree_match.group(2).strip()
+        ref = tree_match.group(3)
+        suffix = tree_match.group(4).strip()
+        if suffix.endswith(":"):
+            suffix = suffix[:-1].strip()
+        role, name = parse_role_name(body)
+        states = _extract_state_tokens(suffix or stripped)
+        return {
+            "ref": ref,
+            "role": role,
+            "name": name,
+            "states": states,
+        }
+
     compact = _COMPACT_REF_LINE_RE.match(line)
     ref = compact.group(2) if compact else None
-    stripped = line.strip()
+    rest = line.strip()
     if ref is not None:
-        stripped = stripped[len(f"- [{ref}]") :].strip()
-        if " options=" in stripped:
-            stripped = stripped.split(" options=", 1)[0].strip()
+        rest = rest[len(f"- [{ref}]") :].strip()
+        if " options=" in rest:
+            rest = rest.split(" options=", 1)[0].strip()
     else:
         match = _REF_IN_LINE_RE.search(line)
         ref = match.group(1) if match else None
         if ref is not None:
-            stripped = _REF_IN_LINE_RE.sub("", stripped).strip()
+            rest = _REF_IN_LINE_RE.sub("", rest).strip()
+            if rest.startswith("- "):
+                rest = rest[2:].strip()
 
-    if stripped.endswith(":"):
-        stripped = stripped[:-1].strip()
-    role = stripped
-    name = None
-    name_match = _ROLE_NAME_RE.match(stripped)
-    if name_match:
-        role = name_match.group(1)
-        name = name_match.group(2)
-    states: list[str] = []
-    for token_match in re.finditer(r"\[([^\]=]+(?:=[^\]]+)?)\]", line):
-        token = token_match.group(1)
-        if token.startswith("ref=") or re.fullmatch(r"e\d+", token):
-            continue
-        states.append(token)
+    if rest.endswith(":"):
+        rest = rest[:-1].strip()
+    role, name = parse_role_name(rest)
     return {
         "ref": ref,
         "role": role,
         "name": name,
-        "states": states,
+        "states": _extract_state_tokens(line),
     }
+
+
+async def resolve_ref_role(
+    page: Page,
+    ref: str,
+    *,
+    fallback_role: str | None = None,
+) -> str:
+    resolved = await _resolve_interactable_role(page, ref)
+    if resolved:
+        return resolved
+    if fallback_role:
+        return normalize_interactive_role(fallback_role)
+    return "generic"
 
 
 async def _normalize_interactable_line_from_dom(page: Page, line: str) -> str:
@@ -610,21 +838,48 @@ async def _normalize_interactable_line_from_dom(page: Page, line: str) -> str:
         states = name_match.group(3) if name_match else ""
     else:
         states = rest[len(parsed_role) :].strip() if rest.startswith(parsed_role) else ""
-    try:
-        resolved_role = await ref_locator(page, ref).evaluate(_RESOLVE_INTERACTABLE_ROLE_JS)
-    except Exception:
+    resolved_role = await _resolve_interactable_role(page, ref)
+    if not resolved_role or resolved_role == normalize_interactive_role(parsed_role):
         return line
-    if not resolved_role or resolved_role == parsed_role:
-        return line
-    normalized = normalize_interactive_role(resolved_role)
     rebuilt = format_interactable_line(
         ref,
-        normalized,
+        resolved_role,
         name,
         states=states.strip(),
         option_suffix=options_part or "",
     )
     return f"{indent}{rebuilt}"
+
+
+async def _normalize_tree_line_from_dom(page: Page, line: str) -> str:
+    stripped = line.rstrip()
+    match = _TREE_REF_LINE_RE.match(stripped)
+    if match is None:
+        return line
+    indent, body, ref, suffix = match.groups()
+    parsed_role, name = parse_role_name(body.strip())
+    resolved_role = await _resolve_interactable_role(page, ref)
+    if not resolved_role or resolved_role == normalize_interactive_role(parsed_role):
+        return line
+    trailing_colon = stripped.endswith(":")
+    return _rebuild_tree_ref_line(
+        indent,
+        resolved_role,
+        name,
+        ref,
+        suffix,
+        trailing_colon=trailing_colon,
+    )
+
+
+async def normalize_tree_roles_from_dom(page: Page, tree_yaml: str) -> str:
+    normalized: list[str] = []
+    for line in tree_yaml.splitlines():
+        if not line.strip():
+            normalized.append(line)
+            continue
+        normalized.append(await _normalize_tree_line_from_dom(page, line))
+    return "\n".join(normalized)
 
 
 async def enrich_interactables(page: Page, interactables: str) -> str:
@@ -667,6 +922,35 @@ async def enrich_interactables(page: Page, interactables: str) -> str:
     return "\n".join(final)
 
 
+_HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+
+
+def is_html_content_type(content_type: str) -> bool:
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type in _HTML_CONTENT_TYPES
+
+
+async def capture_html_snapshot(
+    context: BrowserContext,
+    html: str,
+    *,
+    snapshot_format: SnapshotFormat = "tree",
+    include_urls: bool = False,
+    max_url_len: int = DEFAULT_MAX_URL_LEN,
+) -> str:
+    page = await context.new_page()
+    try:
+        await page.set_content(html, wait_until="domcontentloaded")
+        return await capture_page_snapshot(
+            page,
+            include_urls=include_urls,
+            max_url_len=max_url_len,
+            snapshot_format=snapshot_format,
+        )
+    finally:
+        await page.close()
+
+
 def truncate_url(url: str, max_len: int = DEFAULT_MAX_URL_LEN) -> str:
     value = url.strip()
     if len(value) <= max_len:
@@ -695,6 +979,89 @@ def compress_snapshot(
     return "\n".join(lines)
 
 
+def _tree_node_has_children(lines: list[str], index: int) -> bool:
+    if index >= len(lines):
+        return False
+    parent_indent = _line_indent(lines[index])
+    for line in lines[index + 1 :]:
+        if not line.strip():
+            continue
+        if _line_indent(line) <= parent_indent:
+            break
+        return True
+    return False
+
+
+def _snapshot_needs_iframe_retry(raw: str) -> bool:
+    lines = raw.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped in ("- insertion", "- iframe"):
+            if not _tree_node_has_children(lines, index):
+                return True
+            continue
+        iframe_match = _IFRAME_REF_LINE_RE.match(line.rstrip())
+        if iframe_match is not None and not _tree_node_has_children(lines, index):
+            return True
+    return False
+
+
+async def _enrich_hollow_iframe_snapshots(
+    page: Page,
+    raw: str,
+    *,
+    depth: int | None,
+    boxes: bool,
+) -> tuple[str, bool]:
+    lines = raw.splitlines()
+    result_lines: list[str] = []
+    did_enrich = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        iframe_match = _IFRAME_REF_LINE_RE.match(line.rstrip())
+        if iframe_match is None or _tree_node_has_children(lines, index):
+            result_lines.append(line)
+            index += 1
+            continue
+
+        iframe_ref = iframe_match.group(2)
+        parent_indent = len(iframe_match.group(1))
+        try:
+            scoped = await ref_locator(page, iframe_ref).aria_snapshot(
+                mode="ai",
+                depth=depth,
+                boxes=boxes,
+            )
+        except Exception:
+            result_lines.append(line)
+            index += 1
+            continue
+
+        scoped_lines = [entry for entry in scoped.splitlines() if entry.strip()]
+        if not scoped_lines:
+            result_lines.append(line)
+            index += 1
+            continue
+
+        did_enrich = True
+        trimmed = line.rstrip()
+        if not trimmed.endswith(":"):
+            trimmed += ":"
+        result_lines.append(trimmed)
+
+        child_prefix = " " * (parent_indent + 2)
+        for scoped_line in scoped_lines:
+            stripped = scoped_line.lstrip()
+            if stripped.startswith("- "):
+                result_lines.append(f"{child_prefix}{stripped}")
+            else:
+                result_lines.append(f"{child_prefix}- {stripped}")
+        index += 1
+
+    return "\n".join(result_lines), did_enrich
+
+
 async def capture_page_snapshot(
     page: Page,
     *,
@@ -716,6 +1083,21 @@ async def capture_page_snapshot(
         await page.aria_snapshot(mode="ai")
     else:
         raw = await page.aria_snapshot(mode="ai", depth=depth, boxes=boxes)
+        for _ in range(SNAPSHOT_IFRAME_RETRY_COUNT):
+            if not _snapshot_needs_iframe_retry(raw):
+                break
+            await asyncio.sleep(SNAPSHOT_IFRAME_RETRY_DELAY_S)
+            raw = await page.aria_snapshot(mode="ai", depth=depth, boxes=boxes)
+
+        enriched, did_enrich = await _enrich_hollow_iframe_snapshots(
+            page,
+            raw,
+            depth=depth,
+            boxes=boxes,
+        )
+        if did_enrich:
+            raw = enriched
+            await page.aria_snapshot(mode="ai")
     tree = compress_snapshot(
         raw,
         include_urls=include_urls,
@@ -724,6 +1106,8 @@ async def capture_page_snapshot(
     formatted = apply_snapshot_format(tree, snapshot_format)
     if snapshot_format == "interactive":
         formatted = await enrich_interactables(page, formatted)
+    else:
+        formatted = await normalize_tree_roles_from_dom(page, formatted)
     return formatted
 
 
@@ -826,6 +1210,7 @@ async def get_node_result(
     )
     headline = next((line for line in subtree.splitlines() if line.strip()), "")
     parsed = parse_node_headline(headline)
+    role = await resolve_ref_role(page, normalized, fallback_role=parsed["role"])
 
     value: str | None = None
     try:
@@ -845,7 +1230,7 @@ async def get_node_result(
     return {
         "page_id": page_id,
         "ref": normalized,
-        "role": parsed["role"],
+        "role": role,
         "name": parsed["name"],
         "states": parsed["states"],
         "value": value,

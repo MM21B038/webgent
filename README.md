@@ -46,7 +46,7 @@ url = "http://127.0.0.1:1234/mcp"
 - **`headless`** — `false` opens a visible Chromium window; `true` runs without a display (servers, SSH, CI).
 - **`display`** — X11 display for headed mode (e.g. `:0.0`). When set, webgent applies it before launching the browser. Leave empty to use the process `DISPLAY` env.
 - **`server`** — HTTP transport settings. The MCP endpoint is `http://{host}:{port}/mcp`.
-- **`mcp.cursor`** — suggested URL for the Cursor MCP entry below.
+- **`mcp.cursor`** — suggested URL, MCP prompt name, and server-info resource URI for the Cursor MCP entry below.
 
 ## Run
 
@@ -72,9 +72,31 @@ Start `webgent` first, then add to your MCP settings using the URL from `setting
 }
 ```
 
+After connecting, use the MCP prompt `agent_system_prompt` for agent instructions and read `webgent://server-info` for full project docs (names listed in `settings.toml` under `[mcp.cursor]`).
+
 Display and headless mode are read from `settings.toml` at server startup — no need to pass `DISPLAY` in the MCP env block.
 
 Restart Cursor after changing MCP config or server code.
+
+### MCP prompt
+
+Agent instructions from `prompt.md` are exposed as an MCP prompt (not a resource):
+
+| Prompt name | File | Description |
+|-------------|------|-------------|
+| `agent_system_prompt` | `prompt.md` | When to use webgent, tool order, and action rules |
+
+Fetch with `list_prompts` / `get_prompt`.
+
+### MCP resources
+
+Project documentation is exposed as an MCP resource:
+
+| Resource URI | File | Description |
+|--------------|------|-------------|
+| `webgent://server-info` | `README.md` | Install, configuration, tools, and development notes |
+
+Read with `list_resources` / `read_resource`.
 
 ## Agent workflow
 
@@ -97,10 +119,15 @@ Non-actionable structure is kept as context; controls are compact lines with ref
 - form:
   - [e3] textbox "Email"
   - [e4] combobox "Country" options="United States" | "United Kingdom"
-  - [e5] button "Submit" [cursor=pointer]
+  - [e5] checkbox "Subscribe"
+  - [e6] radio "Pro plan"
+  - [e7] file "Upload file"
+  - [e8] button "Submit" [cursor=pointer]
 ```
 
-Combobox and listbox options are inlined on the parent line. Pass `ref` to scope interactables to a subtree; pass `depth` to limit capture depth.
+Roles are resolved from the DOM where the accessibility tree is misleading — for example `<input type="file">` is labeled `file` (not `button`), and `<select>` dropdown options are inlined on combobox lines. Checkbox, radio, slider, switch, spinbutton, and other input types use their control role when present. The same DOM role resolution applies to **`snapshot`**, **`get_node`**, and **`interactables`**.
+
+Pass `ref` to scope interactables to a subtree; pass `depth` to limit capture depth.
 
 ### Action responses
 
@@ -142,6 +169,31 @@ When a click opens a new tab, `opened_new_page` is `true`, `previous_page_id` is
 | `get_node` | Role, name, states, value, checked, and a small subtree for one ref |
 | `get_url` | Full `href` for a link ref |
 | `screenshot` | Viewport, full-page, or element PNG/JPEG under `media/` |
+| `captcha_ocr` | OCR a captcha image element by ref via ddddocr |
+| `evaluate_js` | Run JavaScript in the page context |
+| `get_form_data` | Extract forms, hidden fields, and CSRF token from the page |
+| `get_cookies` | List session cookies (optional URL filter) |
+| `set_cookies` | Add cookies to the session |
+
+### Network capture
+
+| Tool | Description |
+|------|-------------|
+| `get_captured_response` | Response body (`format=tree` or `format=raw`) |
+| `get_captured_request_headers` | Request headers for a capture id |
+| `get_captured_request_body` | Request body for a capture id |
+| `get_captured_response_headers` | Response headers for a capture id |
+| `register_request` | Persist a capture to `registry/{request_id}/` |
+
+Pass `capture_requests=true` on navigation and action tools to record network activity.
+
+### HTTP replay
+
+| Tool | Description |
+|------|-------------|
+| `http_request` | Send HTTP with session cookies (`body`, `data`, or `json`) |
+| `encrypt_rsa` | Encrypt plaintext via page JS or server-side RSA |
+| `replay_request` | Replay a capture/registered request with overrides |
 
 ### Actions
 
@@ -177,6 +229,7 @@ webgent/
   browser.py     Session, page, and action logic
   snapshot.py    Snapshots, interactables tree, ref helpers
   screenshot.py  Screenshot capture
+  captcha_ocr.py Captcha OCR via ddddocr
   files.py       Upload file resolution
   config.py      Settings loader and paths (profile/, media/)
 settings.toml    Browser headless/display and MCP hints

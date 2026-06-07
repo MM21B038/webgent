@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
 DEFAULT_MAX_RESPONSE_BYTES = 32768
 MAX_CAPTURE_ENTRIES = 500
 SETTLE_TIMEOUT_MS = 2000
+RESPONSE_WAIT_TIMEOUT_S = 2.0
 
 
 @dataclass
@@ -81,6 +83,9 @@ class NetworkCaptureStore:
             raise ValueError(f"Unknown request_id: {request_id}")
         return entry
 
+    def try_get(self, request_id: str) -> CapturedRequest | None:
+        return self._entries.get(request_id)
+
     def summaries(
         self,
         entry_ids: list[str],
@@ -98,9 +103,18 @@ class NetworkCaptureStore:
 
 
 class ActionNetworkCapture:
-    def __init__(self, store: NetworkCaptureStore, session: BrowserSession) -> None:
+    def __init__(
+        self,
+        store: NetworkCaptureStore,
+        session: BrowserSession,
+        *,
+        cdp_post_data: Any | None = None,
+        proxy_capture: Any | None = None,
+    ) -> None:
         self._store = store
         self._session = session
+        self._cdp_post_data = cdp_post_data
+        self._proxy_capture = proxy_capture
         self._active = False
         self.captured_ids: list[str] = []
 
@@ -116,6 +130,21 @@ class ActionNetworkCapture:
         entry = self._store.add_from_request(request)
         if entry is not None and entry.id not in self.captured_ids:
             self.captured_ids.append(entry.id)
+            if self._proxy_capture is not None:
+                self._proxy_capture.register_capture(
+                    entry.id,
+                    request.method,
+                    request.url,
+                )
+            if self._cdp_post_data is not None:
+                from webgent.cdp_post_data import request_likely_has_body
+
+                try:
+                    has_buffer = bool(request.post_data_buffer)
+                except Exception:
+                    has_buffer = False
+                if not has_buffer and request_likely_has_body(request):
+                    self._cdp_post_data.register_pending(entry.id)
 
     def _on_response(self, response: Response) -> None:
         if not self._active:
@@ -138,7 +167,10 @@ class ActionNetworkCapture:
             if entry._response is not None:
                 continue
             try:
-                response = await entry._request.response()
+                response = await asyncio.wait_for(
+                    entry._request.response(),
+                    timeout=RESPONSE_WAIT_TIMEOUT_S,
+                )
             except Exception:
                 continue
             if response is not None:
