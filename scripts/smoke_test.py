@@ -451,6 +451,61 @@ async def test_cross_frame_refs() -> None:
     print("cross frame refs test passed")
 
 
+async def test_vision_query() -> None:
+    import os
+    from unittest.mock import patch
+
+    from webgent.vlm import VLM_UNAVAILABLE_MESSAGE
+
+    manager = BrowserManager()
+    await manager.start()
+    try:
+        session_info = await manager.create_session(
+            "vision-query-test",
+            initial_url=(
+                "data:text/html,<html><body>"
+                '<img alt="Vision Test" '
+                'src="data:image/gif;base64,'
+                "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+                '">'
+                "</body></html>"
+            ),
+        )
+        session = manager.get_session(session_info["session_id"])
+
+        with patch.dict(os.environ, {"BASE_URL": "", "API_KEY": ""}, clear=False):
+            unavailable = await session.vision_query("What text is on this page?")
+        assert unavailable["available"] is False
+        assert unavailable["message"] == VLM_UNAVAILABLE_MESSAGE
+        assert unavailable["mode"] == "viewport"
+        assert unavailable["prompt"] == "What text is on this page?"
+        assert unavailable["error"]
+
+        with patch("webgent.browser.query_vlm", return_value="Vision Test"):
+            success = await session.vision_query("What alt text is shown?")
+        assert success["available"] is True
+        assert success["response"] == "Vision Test"
+        assert success["mode"] == "viewport"
+
+        interactables = await session.page_interactables()
+        img_ref = find_ref(interactables["interactables"], "img", "vision test")
+        assert img_ref is not None
+        with patch("webgent.browser.query_vlm", return_value="Vision Test"):
+            element_result = await session.vision_query(
+                "Describe this element",
+                ref=img_ref,
+            )
+        assert element_result["available"] is True
+        assert element_result["mode"] == "element"
+        assert element_result["ref"] == img_ref
+
+        await manager.close_session(session_info["session_id"])
+    finally:
+        await manager.stop()
+
+    print("vision query test passed")
+
+
 async def test_browser_manager() -> None:
     manager = BrowserManager()
     await manager.start()
@@ -514,6 +569,18 @@ async def test_browser_manager() -> None:
         assert captcha_result["ref"] == captcha_ref
         assert isinstance(captcha_result["text"], str)
         assert len(captcha_result["text"]) > 0
+
+        from unittest.mock import patch
+
+        with patch("webgent.browser.query_vlm", return_value="AB12"):
+            vision_result = await session.vision_query(
+                "What captcha text is shown?",
+                ref=captcha_ref,
+            )
+        assert vision_result["available"] is True
+        assert vision_result["response"] == "AB12"
+        assert vision_result["mode"] == "element"
+        assert vision_result["ref"] == captcha_ref
 
         await session.goto(
             "data:text/html,<html><body>"
@@ -1202,6 +1269,7 @@ async def test_mcp_tools() -> None:
             "get_url",
             "screenshot",
             "captcha_ocr",
+            "vision_query",
             "get_captured_response",
             "get_captured_request_headers",
             "get_captured_request_body",
@@ -1342,6 +1410,24 @@ async def test_mcp_tools() -> None:
         assert result.data["ref"] == captcha_ref
         assert isinstance(result.data["text"], str)
         assert len(result.data["text"]) > 0
+
+        result = await client.call_tool(
+            "vision_query",
+            {
+                "session_id": session_id,
+                "prompt": "Describe the captcha image briefly.",
+                "ref": captcha_ref,
+            },
+        )
+        vision_data = result.data
+        assert isinstance(vision_data.get("available"), bool)
+        assert vision_data["mode"] == "element"
+        assert vision_data["ref"] == captcha_ref
+        if vision_data["available"]:
+            assert isinstance(vision_data["response"], str)
+            assert len(vision_data["response"]) > 0
+        else:
+            assert "unavailable" in vision_data["message"].lower()
 
         result = await client.call_tool(
             "goto",
@@ -1532,17 +1618,55 @@ async def test_mcp_tools() -> None:
         print("mcp tools smoke test passed")
 
 
+async def test_tool_errors_as_responses() -> None:
+    from fastmcp import FastMCP
+
+    from webgent.mcp_tools import ToolErrorAsResponseMiddleware, wrap_tool_result
+
+    app = FastMCP("tool-error-test")
+    app.add_middleware(ToolErrorAsResponseMiddleware())
+
+    @app.tool
+    @wrap_tool_result
+    async def raises_runtime() -> dict:
+        raise ValueError("runtime failure")
+
+    @app.tool
+    async def bad_args(required: str) -> dict:
+        return {"required": required}
+
+    runtime = await app.call_tool("raises_runtime", {})
+    assert runtime.structured_content["error_type"] == "ValueError"
+    assert "runtime failure" in runtime.structured_content["error"]
+
+    invalid = await app.call_tool(
+        "bad_args",
+        {"unexpected": "value"},
+    )
+    assert invalid.structured_content["error_type"] == "ValidationError"
+    assert invalid.structured_content["tool"] == "bad_args"
+    assert invalid.structured_content["validation_errors"]
+
+    missing = await app.call_tool("missing_tool", {})
+    assert missing.structured_content["error_type"] == "NotFoundError"
+    assert missing.structured_content["tool"] == "missing_tool"
+
+    print("tool error response smoke test passed")
+
+
 async def main() -> None:
     test_compress_snapshot_helpers()
     test_interactive_snapshot_helpers()
     await test_snapshot_role_normalization()
     await test_cross_frame_refs()
+    await test_vision_query()
     await test_browser_manager()
     await test_action_metadata_only()
     await test_fill_verifies_dom_value()
     await test_network_capture()
     await test_request_registry()
     await test_page_inspect_and_http_tools()
+    await test_tool_errors_as_responses()
     await test_mcp_tools()
 
 

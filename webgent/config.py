@@ -45,6 +45,12 @@ class ServerSettings:
 class McpCursorSettings:
     url: str = "http://127.0.0.1:1234/mcp"
 
+@dataclass(frozen=True)
+class AgentSettings:
+    llm_model: str = "DeepSeek"
+    vlm_model: str = "VisionChat"
+    emb_model: str = "Qwen3-Embedding-8B"
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -52,7 +58,7 @@ class Settings:
     proxy: ProxySettings
     server: ServerSettings
     mcp_cursor: McpCursorSettings
-
+    agent: AgentSettings
 
 def _load_toml() -> dict:
     if not SETTINGS_PATH.is_file():
@@ -67,6 +73,7 @@ def load_settings() -> Settings:
     proxy = data.get("proxy", {})
     server = data.get("server", {})
     mcp = data.get("mcp", {}).get("cursor", {})
+    agent = data.get("agent", {})
     host = str(server.get("host", "127.0.0.1"))
     port = int(server.get("port", 1234))
     return Settings(
@@ -90,6 +97,11 @@ def load_settings() -> Settings:
         ),
         mcp_cursor=McpCursorSettings(
             url=str(mcp.get("url", f"http://{host}:{port}/mcp")),
+        ),
+        agent=AgentSettings(
+            llm_model=str(agent.get("llm_model", "DeepSeek")),
+            vlm_model=str(agent.get("vlm_model", "VisionChat")),
+            emb_model=str(agent.get("emb_model", "Qwen3-Embedding-8B")),
         ),
     )
 

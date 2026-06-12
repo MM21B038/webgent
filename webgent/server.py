@@ -21,7 +21,7 @@ from webgent.config import (
     README_PATH,
     SERVER_INFO_RESOURCE_URI,
 )
-from webgent.mcp_tools import wrap_tool_result
+from webgent.mcp_tools import ToolErrorAsResponseMiddleware, wrap_tool_result
 
 _manager: BrowserManager | None = None
 
@@ -40,6 +40,7 @@ async def app_lifespan(server):
 
 
 mcp = FastMCP("webgent", lifespan=app_lifespan)
+mcp.add_middleware(ToolErrorAsResponseMiddleware())
 
 
 def _get_manager() -> BrowserManager:
@@ -148,14 +149,27 @@ SET_SPINBUTTON_DOC = (
 SELECT_TAB_DOC = "Select a tab by ref. " + _ACTION_DOC + _CAPTURE_DOC
 SCREENSHOT_DOC = "Save a viewport, full-page, or element PNG/JPEG under media/."
 CAPTCHA_OCR_DOC = (
-    "Screenshot a captcha image element by ref and run ddddocr text recognition. "
-    "Returns ref and recognized text. Use beta=true for the newer model; "
+    "Screenshot a captcha image element by ref and recognize captcha text. "
+    "mode=ddddocr uses ddddocr only; mode=vlm uses the configured VLM agent "
+    "(BASE_URL, API_KEY, agent.vlm_model) with ddddocr fallback on any VLM error; "
+    "mode=both runs both and prefers VLM text when available. "
+    "Returns ref and recognized text. Use beta=true for the newer ddddocr model; "
     "png_fix=true for transparent PNG captchas."
+)
+VISION_QUERY_DOC = (
+    "Capture a temporary screenshot and ask the configured VLM a prompt about it. "
+    "Screenshot is in-memory only (not saved to media/). "
+    "Use ref for an element screenshot, or omit ref for viewport (default) or "
+    "full_page=true for a full-page capture. "
+    "Requires BASE_URL, API_KEY, and agent.vlm_model. "
+    "Returns available=true with response on success, or available=false with "
+    "message when VLM is not configured or the call fails."
 )
 GET_CAPTURED_RESPONSE_DOC = (
     "Get response body for a captured or registered request id. "
     "HTML responses are returned as parsed snapshot YAML when format=tree; "
     "format=raw returns the original response text. "
+    "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
     "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
 )
 EVALUATE_JS_DOC = (
@@ -188,22 +202,25 @@ REPLAY_REQUEST_DOC = (
 )
 GET_CAPTURED_REQUEST_HEADERS_DOC = (
     "Get request headers for a captured or registered request id. "
+    "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
     "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
 )
 GET_CAPTURED_REQUEST_BODY_DOC = (
     "Get request body for a captured or registered request id. "
+    "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
     "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
 )
 GET_CAPTURED_RESPONSE_HEADERS_DOC = (
     "Get response headers for a captured or registered request id. "
+    "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
     "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
 )
 REGISTER_REQUEST_DOC = (
     "Persist a captured request id to registry/{request_id}/ as four files: "
     "request_header, response_header, request_body, and response (raw body bytes). "
     "HTML responses are converted to snapshot YAML when fetched via get_captured_response. "
-    "Looks up ephemeral captures across active sessions; registered entries "
-    "are read by get_captured_* tools using only request_id."
+    "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
+    "Registered entries are read by get_captured_* tools using only request_id."
 )
 
 
@@ -667,14 +684,19 @@ async def select_tab(
 async def register_request(
     ctx: Context,
     request_id: str,
+    session_id: str | None = None,
 ) -> dict:
-    return await _get_manager().register_request(request_id)
+    return await _get_manager().register_request(
+        request_id,
+        session_id=session_id,
+    )
 
 
 @tool(description=GET_CAPTURED_RESPONSE_DOC)
 async def get_captured_response(
     ctx: Context,
     request_id: str,
+    session_id: str | None = None,
     max_bytes: int = 32768,
     format: str = "tree",
 ) -> dict:
@@ -682,6 +704,7 @@ async def get_captured_response(
         raise ValueError("format must be 'tree' or 'raw'")
     return await _get_manager().get_captured_response(
         request_id,
+        session_id=session_id,
         max_bytes=max_bytes,
         format=format,  # type: ignore[arg-type]
     )
@@ -691,25 +714,38 @@ async def get_captured_response(
 async def get_captured_request_headers(
     ctx: Context,
     request_id: str,
+    session_id: str | None = None,
 ) -> dict:
-    return await _get_manager().get_captured_request_headers(request_id)
+    return await _get_manager().get_captured_request_headers(
+        request_id,
+        session_id=session_id,
+    )
 
 
 @tool(description=GET_CAPTURED_REQUEST_BODY_DOC)
 async def get_captured_request_body(
     ctx: Context,
     request_id: str,
+    session_id: str | None = None,
     max_bytes: int = 32768,
 ) -> dict:
-    return await _get_manager().get_captured_request_body(request_id, max_bytes=max_bytes)
+    return await _get_manager().get_captured_request_body(
+        request_id,
+        session_id=session_id,
+        max_bytes=max_bytes,
+    )
 
 
 @tool(description=GET_CAPTURED_RESPONSE_HEADERS_DOC)
 async def get_captured_response_headers(
     ctx: Context,
     request_id: str,
+    session_id: str | None = None,
 ) -> dict:
-    return await _get_manager().get_captured_response_headers(request_id)
+    return await _get_manager().get_captured_response_headers(
+        request_id,
+        session_id=session_id,
+    )
 
 
 @tool(description=HTTP_REQUEST_DOC)
@@ -826,6 +862,7 @@ async def captcha_ocr(
     session_id: str,
     ref: str,
     page_id: str | None = None,
+    mode: str = "ddddocr",
     beta: bool = False,
     png_fix: bool = False,
 ) -> dict:
@@ -833,8 +870,27 @@ async def captcha_ocr(
     return await session.captcha_ocr(
         ref,
         page_id,
+        mode=mode,  # type: ignore[arg-type]
         beta=beta,
         png_fix=png_fix,
+    )
+
+
+@tool(description=VISION_QUERY_DOC)
+async def vision_query(
+    ctx: Context,
+    session_id: str,
+    prompt: str,
+    page_id: str | None = None,
+    ref: str | None = None,
+    full_page: bool = False,
+) -> dict:
+    session = _get_manager().get_session(session_id)
+    return await session.vision_query(
+        prompt,
+        page_id,
+        ref=ref,
+        full_page=full_page,
     )
 
 

@@ -8,12 +8,13 @@ from typing import Any, Literal, TypeVar
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
-from webgent.captcha_ocr import recognize_captcha
+from webgent.captcha_ocr import CaptchaMode, recognize_captcha_with_mode
 from webgent.cdp_post_data import CdpPostDataCapture
 from webgent.config import PROFILE_DIR, get_settings
 from webgent.files import resolve_upload_files
 from webgent.page_state import PageSnapshotState
 from webgent.screenshot import capture_screenshot, save_screenshot, screenshot_metadata
+from webgent.vlm import VLM_UNAVAILABLE_MESSAGE, VlmError, query_vlm, vlm_failure_reason
 from webgent.network_capture import (
     DEFAULT_MAX_RESPONSE_BYTES,
     ActionNetworkCapture,
@@ -1238,20 +1239,82 @@ class BrowserSession:
         ref: str,
         page_id: str | None = None,
         *,
+        mode: CaptchaMode = "ddddocr",
         beta: bool = False,
         png_fix: bool = False,
     ) -> dict[str, Any]:
         page, resolved_page_id = self._resolve_page(page_id)
         locator = await resolve_ref_locator(page, ref)
         image_data = await locator.screenshot(type="png")
-        text = await recognize_captcha(image_data, beta=beta, png_fix=png_fix)
+        ocr_result = await recognize_captcha_with_mode(
+            image_data,
+            mode=mode,
+            beta=beta,
+            png_fix=png_fix,
+        )
         return {
             "page_id": resolved_page_id,
             "url": page.url,
             "title": await page.title(),
             "ref": normalize_ref(ref),
-            "text": text,
+            **ocr_result,
         }
+
+    async def vision_query(
+        self,
+        prompt: str,
+        page_id: str | None = None,
+        *,
+        ref: str | None = None,
+        full_page: bool = False,
+    ) -> dict[str, Any]:
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("prompt must not be empty")
+
+        if ref is not None and full_page:
+            full_page = False
+
+        page, resolved_page_id = self._resolve_page(page_id)
+        image_data, mode = await capture_screenshot(
+            page,
+            ref=ref,
+            full_page=full_page,
+            image_type="png",
+        )
+        result: dict[str, Any] = {
+            "page_id": resolved_page_id,
+            "url": page.url,
+            "title": await page.title(),
+            "mode": mode,
+            "prompt": prompt,
+        }
+        if ref is not None:
+            result["ref"] = normalize_ref(ref)
+
+        try:
+            response = await query_vlm(image_data, prompt)
+        except VlmError as exc:
+            result.update(
+                {
+                    "available": False,
+                    "error": str(exc),
+                    "message": VLM_UNAVAILABLE_MESSAGE,
+                }
+            )
+            return result
+        except Exception as exc:
+            result.update(
+                {
+                    "available": False,
+                    "error": vlm_failure_reason(exc),
+                    "message": VLM_UNAVAILABLE_MESSAGE,
+                }
+            )
+            return result
+
+        result.update({"available": True, "response": response})
+        return result
 
 
 class BrowserManager:
@@ -1305,6 +1368,21 @@ class BrowserManager:
                 return session
         return None
 
+    def _session_for_request(
+        self,
+        request_id: str,
+        session_id: str | None = None,
+    ) -> BrowserSession:
+        if session_id is not None:
+            session = self.get_session(session_id)
+            if session._network_store.try_get(request_id) is None:
+                raise ValueError(f"Unknown request_id: {request_id}")
+            return session
+        session = self._find_session_with_request(request_id)
+        if session is None:
+            raise ValueError(f"Unknown request_id: {request_id}")
+        return session
+
     def _any_context(self) -> BrowserContext | None:
         for session in self._sessions.values():
             return session.context
@@ -1342,7 +1420,12 @@ class BrowserManager:
             self._transform_context = await self._transform_browser.new_context()
         return self._transform_context
 
-    async def register_request(self, request_id: str) -> dict[str, Any]:
+    async def register_request(
+        self,
+        request_id: str,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         if self._registry.exists(request_id):
             meta = self._registry.load_meta(request_id)
             return {
@@ -1354,9 +1437,7 @@ class BrowserManager:
                 "has_response": meta.get("has_response"),
                 "already_registered": True,
             }
-        session = self._find_session_with_request(request_id)
-        if session is None:
-            raise ValueError(f"Unknown request_id: {request_id}")
+        session = self._session_for_request(request_id, session_id)
         return await self._registry.save_from_capture(
             session._network_store.get(request_id),
             cdp_post_data=session._cdp_post_data,
@@ -1367,6 +1448,7 @@ class BrowserManager:
         self,
         request_id: str,
         *,
+        session_id: str | None = None,
         max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         format: Literal["tree", "raw"] = "tree",
     ) -> dict[str, Any]:
@@ -1377,14 +1459,12 @@ class BrowserManager:
                 max_bytes=max_bytes,
                 format=format,
             )
-        session = self._find_session_with_request(request_id)
-        if session is not None:
-            return await session.get_captured_response(
-                request_id,
-                max_bytes=max_bytes,
-                format=format,
-            )
-        raise ValueError(f"Unknown request_id: {request_id}")
+        session = self._session_for_request(request_id, session_id)
+        return await session.get_captured_response(
+            request_id,
+            max_bytes=max_bytes,
+            format=format,
+        )
 
     async def replay_request(
         self,
@@ -1417,37 +1497,42 @@ class BrowserManager:
             format=format,
         )
 
-    async def get_captured_request_headers(self, request_id: str) -> dict[str, Any]:
+    async def get_captured_request_headers(
+        self,
+        request_id: str,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         if self._registry.exists(request_id):
             return self._registry.get_request_headers(request_id)
-        session = self._find_session_with_request(request_id)
-        if session is not None:
-            return await session.get_captured_request_headers(request_id)
-        raise ValueError(f"Unknown request_id: {request_id}")
+        session = self._session_for_request(request_id, session_id)
+        return await session.get_captured_request_headers(request_id)
 
     async def get_captured_request_body(
         self,
         request_id: str,
         *,
+        session_id: str | None = None,
         max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> dict[str, Any]:
         if self._registry.exists(request_id):
             return self._registry.get_request_body(request_id, max_bytes=max_bytes)
-        session = self._find_session_with_request(request_id)
-        if session is not None:
-            return await session.get_captured_request_body(
-                request_id,
-                max_bytes=max_bytes,
-            )
-        raise ValueError(f"Unknown request_id: {request_id}")
+        session = self._session_for_request(request_id, session_id)
+        return await session.get_captured_request_body(
+            request_id,
+            max_bytes=max_bytes,
+        )
 
-    async def get_captured_response_headers(self, request_id: str) -> dict[str, Any]:
+    async def get_captured_response_headers(
+        self,
+        request_id: str,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         if self._registry.exists(request_id):
             return self._registry.get_response_headers(request_id)
-        session = self._find_session_with_request(request_id)
-        if session is not None:
-            return await session.get_captured_response_headers(request_id)
-        raise ValueError(f"Unknown request_id: {request_id}")
+        session = self._session_for_request(request_id, session_id)
+        return await session.get_captured_response_headers(request_id)
 
     async def create_session(
         self,
