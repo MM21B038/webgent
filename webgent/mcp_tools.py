@@ -25,6 +25,9 @@ def tool_error(
     }
     if tool is not None:
         result["tool"] = tool
+    hint = getattr(exc, "hint", None)
+    if hint:
+        result["hint"] = hint
     if isinstance(exc, PydanticValidationError):
         result["validation_errors"] = exc.errors(include_url=False)
     return result

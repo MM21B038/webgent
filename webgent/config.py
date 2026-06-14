@@ -42,6 +42,15 @@ class ServerSettings:
 
 
 @dataclass(frozen=True)
+class SnapshotSettings:
+    list_threshold: int = 30
+    list_head: int = 10
+    list_tail: int = 10
+    iframe_retry_count: int = 2
+    iframe_retry_delay_s: float = 0.5
+
+
+@dataclass(frozen=True)
 class McpCursorSettings:
     url: str = "http://127.0.0.1:1234/mcp"
 
@@ -57,6 +66,7 @@ class Settings:
     browser: BrowserSettings
     proxy: ProxySettings
     server: ServerSettings
+    snapshot: SnapshotSettings
     mcp_cursor: McpCursorSettings
     agent: AgentSettings
 
@@ -74,8 +84,9 @@ def load_settings() -> Settings:
     server = data.get("server", {})
     mcp = data.get("mcp", {}).get("cursor", {})
     agent = data.get("agent", {})
+    snapshot = data.get("snapshot", {})
     host = str(server.get("host", "127.0.0.1"))
-    port = int(server.get("port", 1234))
+    port = int(os.environ.get("WEBGENT_SERVER_PORT", server.get("port", 1234)))
     return Settings(
         browser=BrowserSettings(
             headless=bool(browser.get("headless", False)),
@@ -94,6 +105,13 @@ def load_settings() -> Settings:
             transport=str(server.get("transport", "http")),
             host=host,
             port=port,
+        ),
+        snapshot=SnapshotSettings(
+            list_threshold=int(snapshot.get("list_threshold", 30)),
+            list_head=int(snapshot.get("list_head", 10)),
+            list_tail=int(snapshot.get("list_tail", 10)),
+            iframe_retry_count=int(snapshot.get("iframe_retry_count", 2)),
+            iframe_retry_delay_s=float(snapshot.get("iframe_retry_delay_s", 0.5)),
         ),
         mcp_cursor=McpCursorSettings(
             url=str(mcp.get("url", f"http://{host}:{port}/mcp")),

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 from playwright.async_api import BrowserContext, Locator, Page
 
+from webgent.config import get_settings
+
 # Playwright aria snapshots use eN on the main frame and fNeM for cross-frame refs.
 _ARIA_REF = r"(?:f\d+)?e\d+"
 _REF_RE = re.compile(rf"^{_ARIA_REF}$")
@@ -25,9 +27,30 @@ _CHILD_OPTION_QUOTED_RE = re.compile(r"""^(\s*)- 'option "([^"]*)"'(.*)$""")
 _CHILD_OPTION_REF_RE = re.compile(
     rf'^(\s*)- option "([^"]*)" \[ref=({_ARIA_REF})\](.*?)(?::\s*)?$'
 )
+_IFRAME_UNAVAILABLE_SUFFIX = " (content unavailable)"
+_REPETITIVE_SIBLING_ROLES = frozenset(
+    {"row", "listitem", "generic", "gridcell", "cell", "table", "group"}
+)
+_VALUE_ENRICH_ROLES = frozenset(
+    {"textbox", "searchbox", "textarea", "spinbutton", "slider"}
+)
+_CHECKED_ENRICH_ROLES = frozenset({"checkbox", "radio", "switch"})
+_SELECTED_ENRICH_ROLES = frozenset({"combobox", "listbox"})
+_ENRICH_SUFFIX_RE = re.compile(r'\b(value|checked|selected)=')
+
+
+class ActionError(ValueError):
+    def __init__(self, message: str, *, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.hint = hint
+
+
+def get_snapshot_settings() -> Any:
+    return get_settings().snapshot
+
+
 _IFRAME_REF_LINE_RE = re.compile(rf"^(\s*)- iframe\b.*\[ref=({_ARIA_REF})\]")
-SNAPSHOT_IFRAME_RETRY_COUNT = 2
-SNAPSHOT_IFRAME_RETRY_DELAY_S = 0.5
+
 _OPTION_CONTAINER_ROLES = frozenset({"combobox", "listbox"})
 _FORM_CONTROL_STATE_RE = re.compile(
     r"\[(checked|unchecked|selected|pressed|expanded|collapsed|disabled|required|invalid|readonly)\]"
@@ -406,7 +429,7 @@ def ref_locator(page: Page, ref: str) -> Locator:
 
 
 _REF_NOT_FOUND_MSG = (
-    "Call interactables again to get fresh refs after navigation or DOM changes."
+    "Call snapshot again to get fresh refs after navigation or DOM changes."
 )
 
 
@@ -418,7 +441,10 @@ async def resolve_ref_locator(page: Page, ref: str) -> Locator:
     await page.aria_snapshot(mode="ai")
     locator = ref_locator(page, normalized)
     if await locator.count() == 0:
-        raise ValueError(f"Ref {normalized!r} not found on the page. {_REF_NOT_FOUND_MSG}")
+        raise ActionError(
+            f"Ref {normalized!r} not found on the page. {_REF_NOT_FOUND_MSG}",
+            hint="Run snapshot to refresh refs after navigation or DOM changes.",
+        )
     return locator
 
 
@@ -528,7 +554,10 @@ _SET_DATEPICKER_VALUE_JS = """(el, val) => {
 async def fill_ref(locator: Locator, value: str) -> str:
     state = await locator.evaluate(_DETECT_FILL_STATE_JS)
     if state.get("disabled"):
-        raise ValueError("Fill failed: element is disabled.")
+        raise ActionError(
+            "Fill failed: element is disabled.",
+            hint="Click the required tab, mode, or login trigger first, then snapshot again.",
+        )
 
     is_datepicker = (
         state.get("jqueryDatepicker")
@@ -544,9 +573,10 @@ async def fill_ref(locator: Locator, value: str) -> str:
             )
         return actual
     if state.get("readonly"):
-        raise ValueError(
+        raise ActionError(
             "Fill failed: element is readonly. "
-            "If this is a date field, use fill with dd-mm-yyyy (e.g. 15-06-1990)."
+            "If this is a date field, use fill with dd-mm-yyyy (e.g. 15-06-1990).",
+            hint="Click the required tab, mode, or login trigger first, then snapshot again.",
         )
 
     await locator.fill(value)
@@ -590,7 +620,18 @@ async def click_ref(page: Page, ref: str) -> None:
             }"""
         )
         if not clicked_overlay:
-            await locator.click(force=True, **click_kwargs)
+            try:
+                await locator.click(force=True, **click_kwargs)
+            except Exception as force_exc:
+                if _click_intercepted(force_exc):
+                    raise ActionError(
+                        str(force_exc),
+                        hint=(
+                            "Possible overlay, modal, or iframe is blocking the click. "
+                            "Run snapshot, dismiss the blocker, then retry."
+                        ),
+                    ) from force_exc
+                raise
 
 
 def extract_ref_from_line(line: str) -> str | None:
@@ -672,6 +713,19 @@ def _parse_tree_lines(lines: list[str]) -> list[_TreeNode]:
                     raw_line=stripped,
                 )
             )
+            continue
+
+        if parent is not None:
+            parent.children.append(
+                _TreeNode(
+                    indent=indent,
+                    role="raw",
+                    name=None,
+                    ref=None,
+                    suffix="",
+                    raw_line=stripped,
+                )
+            )
 
     return roots
 
@@ -679,6 +733,283 @@ def _parse_tree_lines(lines: list[str]) -> list[_TreeNode]:
 _OPTION_CHILD_ROLES = frozenset(
     {"option", "menuitem", "menuitemcheckbox", "menuitemradio"}
 )
+
+
+def _is_selected_item(item: Any) -> bool:
+    if isinstance(item, _TreeNode):
+        suffix = item.suffix
+        return "selected" in suffix or "checked" in suffix
+    if isinstance(item, str):
+        return "[selected]" in item or "[checked]" in item
+    return False
+
+
+def _truncate_indexed_sequence(
+    items: list[Any],
+    *,
+    threshold: int,
+    head: int,
+    tail: int,
+    ellipsis_label: str,
+) -> list[Any]:
+    if len(items) <= threshold:
+        return items
+    keep_indices: set[int] = set(range(min(head, len(items))))
+    keep_indices.update(range(max(len(items) - tail, 0), len(items)))
+    for index, item in enumerate(items):
+        if _is_selected_item(item):
+            keep_indices.add(index)
+    ordered = sorted(keep_indices)
+    result: list[Any] = []
+    previous = -1
+    for index in ordered:
+        if previous >= 0 and index > previous + 1:
+            result.append(("ellipsis", index - previous - 1, ellipsis_label))
+        result.append(items[index])
+        previous = index
+    return result
+
+
+def _truncate_inline_options_line(
+    line: str,
+    *,
+    threshold: int,
+    head: int,
+    tail: int,
+) -> str:
+    base, suffix = _split_options_suffix(line)
+    if suffix is None:
+        return line
+    content = suffix[len(" options=") :]
+    parts = [part.strip() for part in content.split(" | ") if part.strip()]
+    if len(parts) <= threshold:
+        return line
+    truncated = _truncate_indexed_sequence(
+        parts,
+        threshold=threshold,
+        head=head,
+        tail=tail,
+        ellipsis_label="options",
+    )
+    rebuilt: list[str] = []
+    for item in truncated:
+        if isinstance(item, tuple) and item[0] == "ellipsis":
+            rebuilt.append(f"... {item[1]} {item[2]} omitted ...")
+        else:
+            rebuilt.append(str(item))
+    return f"{base} options={' | '.join(rebuilt)}"
+
+
+def _ellipsis_tree_node(indent: int, count: int, label: str) -> _TreeNode:
+    text = f"... {count} {label} omitted ..."
+    return _TreeNode(
+        indent=indent,
+        role="ellipsis",
+        name=None,
+        ref=None,
+        suffix="",
+        raw_line=f'{" " * indent}- {text}',
+    )
+
+
+def _render_tree_node(node: _TreeNode) -> list[str]:
+    if node.role == "ellipsis":
+        return [node.raw_line]
+    if node.role == "raw":
+        return [node.raw_line]
+    lines: list[str] = []
+    if node.raw_line:
+        header = node.raw_line
+        if node.children and not header.rstrip().endswith(":"):
+            header = header.rstrip() + ":"
+        lines.append(header)
+    elif node.ref is not None:
+        body = f'{node.role} "{node.name}"' if node.name else node.role
+        header = f'{" " * node.indent}- {body} [ref={node.ref}]'
+        if node.suffix:
+            header += f" {node.suffix}"
+        if node.children:
+            header += ":"
+        lines.append(header)
+    else:
+        lines.append(f'{" " * node.indent}{format_structural_line(node.role, node.name)}')
+    for child in node.children:
+        lines.extend(_render_tree_node(child))
+    return lines
+
+
+def _render_tree_nodes(nodes: list[_TreeNode]) -> list[str]:
+    lines: list[str] = []
+    for node in nodes:
+        lines.extend(_render_tree_node(node))
+    return lines
+
+
+def _truncate_tree_node(
+    node: _TreeNode,
+    threshold: int,
+    head: int,
+    tail: int,
+) -> _TreeNode:
+    option_children = [
+        child for child in node.children if child.role in _OPTION_CHILD_ROLES
+    ]
+    other_children = [
+        child for child in node.children if child.role not in _OPTION_CHILD_ROLES
+    ]
+    if node.role in _OPTION_CONTAINER_ROLES and len(option_children) > threshold:
+        truncated_options = _truncate_indexed_sequence(
+            option_children,
+            threshold=threshold,
+            head=head,
+            tail=tail,
+            ellipsis_label="options",
+        )
+        node.children = []
+        for item in truncated_options:
+            if isinstance(item, tuple) and item[0] == "ellipsis":
+                node.children.append(
+                    _ellipsis_tree_node(node.indent + 2, item[1], item[2])
+                )
+            else:
+                node.children.append(_truncate_tree_node(item, threshold, head, tail))
+        node.children.extend(
+            _truncate_tree_node(child, threshold, head, tail)
+            for child in other_children
+        )
+        return node
+
+    node.children = _truncate_child_groups(
+        node.children, node.indent, threshold, head, tail
+    )
+    return node
+
+
+def _truncate_child_groups(
+    children: list[_TreeNode],
+    parent_indent: int,
+    threshold: int,
+    head: int,
+    tail: int,
+) -> list[_TreeNode]:
+    result: list[_TreeNode] = []
+    index = 0
+    while index < len(children):
+        role = children[index].role
+        end = index + 1
+        while (
+            end < len(children)
+            and children[end].role == role
+            and role in _REPETITIVE_SIBLING_ROLES
+        ):
+            end += 1
+        group = children[index:end]
+        if len(group) > threshold:
+            truncated = _truncate_indexed_sequence(
+                group,
+                threshold=threshold,
+                head=head,
+                tail=tail,
+                ellipsis_label=f"{role}s",
+            )
+            for item in truncated:
+                if isinstance(item, tuple) and item[0] == "ellipsis":
+                    result.append(
+                        _ellipsis_tree_node(parent_indent + 2, item[1], item[2])
+                    )
+                else:
+                    result.append(_truncate_tree_node(item, threshold, head, tail))
+        else:
+            for child in group:
+                result.append(_truncate_tree_node(child, threshold, head, tail))
+        index = end
+    return result
+
+
+def truncate_repetitive_lists(
+    tree_yaml: str,
+    *,
+    threshold: int = 30,
+    head: int = 10,
+    tail: int = 10,
+) -> str:
+    inline_truncated = "\n".join(
+        _truncate_inline_options_line(
+            line,
+            threshold=threshold,
+            head=head,
+            tail=tail,
+        )
+        for line in tree_yaml.splitlines()
+    )
+    roots = _parse_tree_lines(inline_truncated.splitlines())
+    truncated_roots = [
+        _truncate_tree_node(node, threshold, head, tail) for node in roots
+    ]
+    return "\n".join(_render_tree_nodes(truncated_roots))
+
+
+async def enrich_snapshot_state_from_dom(page: Page, tree_yaml: str) -> str:
+    enriched: list[str] = []
+    for line in tree_yaml.splitlines():
+        if not line.strip() or _ENRICH_SUFFIX_RE.search(line):
+            enriched.append(line)
+            continue
+        ref = extract_ref_from_line(line)
+        if ref is None:
+            enriched.append(line)
+            continue
+        parsed = parse_node_headline(line)
+        role = normalize_interactive_role(parsed["role"])
+        suffix_parts: list[str] = []
+        locator = ref_locator(page, ref)
+        try:
+            if role in _VALUE_ENRICH_ROLES:
+                value = await read_locator_value(locator)
+                if value:
+                    escaped = value.replace('"', '\\"')
+                    suffix_parts.append(f'value="{escaped}"')
+            elif role in _CHECKED_ENRICH_ROLES:
+                checked = await locator.is_checked()
+                suffix_parts.append(f"checked={'true' if checked else 'false'}")
+            elif role in _SELECTED_ENRICH_ROLES:
+                selected = await locator.input_value()
+                if selected:
+                    escaped = selected.replace('"', '\\"')
+                    suffix_parts.append(f'selected="{escaped}"')
+        except Exception:
+            enriched.append(line)
+            continue
+        if not suffix_parts:
+            enriched.append(line)
+            continue
+        trimmed = line.rstrip()
+        trailing_colon = trimmed.endswith(":")
+        if trailing_colon:
+            trimmed = trimmed[:-1].rstrip()
+        enriched.append(
+            f"{trimmed} {' '.join(suffix_parts)}{':' if trailing_colon else ''}"
+        )
+    return "\n".join(enriched)
+
+
+async def apply_snapshot_postprocessing(
+    page: Page,
+    tree_yaml: str,
+    *,
+    snapshot_format: SnapshotFormat,
+) -> str:
+    settings = get_snapshot_settings()
+    processed = truncate_repetitive_lists(
+        tree_yaml,
+        threshold=settings.list_threshold,
+        head=settings.list_head,
+        tail=settings.list_tail,
+    )
+    if snapshot_format == "interactive":
+        return await enrich_interactables(page, processed)
+    processed = await enrich_snapshot_state_from_dom(page, processed)
+    return await normalize_tree_roles_from_dom(page, processed)
 
 
 def _collect_option_nodes(node: _TreeNode) -> list[tuple[str | None, str, str]]:
@@ -1012,10 +1343,11 @@ async def _enrich_hollow_iframe_snapshots(
     *,
     depth: int | None,
     boxes: bool,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, int]:
     lines = raw.splitlines()
     result_lines: list[str] = []
     did_enrich = False
+    unavailable_count = 0
     index = 0
     while index < len(lines):
         line = lines[index]
@@ -1034,13 +1366,21 @@ async def _enrich_hollow_iframe_snapshots(
                 boxes=boxes,
             )
         except Exception:
-            result_lines.append(line)
+            unavailable_count += 1
+            trimmed = line.rstrip()
+            if _IFRAME_UNAVAILABLE_SUFFIX not in trimmed:
+                trimmed += _IFRAME_UNAVAILABLE_SUFFIX
+            result_lines.append(trimmed)
             index += 1
             continue
 
         scoped_lines = [entry for entry in scoped.splitlines() if entry.strip()]
         if not scoped_lines:
-            result_lines.append(line)
+            unavailable_count += 1
+            trimmed = line.rstrip()
+            if _IFRAME_UNAVAILABLE_SUFFIX not in trimmed:
+                trimmed += _IFRAME_UNAVAILABLE_SUFFIX
+            result_lines.append(trimmed)
             index += 1
             continue
 
@@ -1059,7 +1399,7 @@ async def _enrich_hollow_iframe_snapshots(
                 result_lines.append(f"{child_prefix}- {stripped}")
         index += 1
 
-    return "\n".join(result_lines), did_enrich
+    return "\n".join(result_lines), did_enrich, unavailable_count
 
 
 async def capture_page_snapshot(
@@ -1078,37 +1418,45 @@ async def capture_page_snapshot(
             depth=depth,
             boxes=boxes,
         )
-        # Subtree snapshots only stamp refs inside the scope; refresh the full page
-        # so other elements keep stable aria-ref markers for follow-up actions.
         await page.aria_snapshot(mode="ai")
-    else:
-        raw = await page.aria_snapshot(mode="ai", depth=depth, boxes=boxes)
-        for _ in range(SNAPSHOT_IFRAME_RETRY_COUNT):
-            if not _snapshot_needs_iframe_retry(raw):
-                break
-            await asyncio.sleep(SNAPSHOT_IFRAME_RETRY_DELAY_S)
-            raw = await page.aria_snapshot(mode="ai", depth=depth, boxes=boxes)
-
-        enriched, did_enrich = await _enrich_hollow_iframe_snapshots(
-            page,
+        tree = compress_snapshot(
             raw,
-            depth=depth,
-            boxes=boxes,
+            include_urls=include_urls,
+            max_url_len=max_url_len,
         )
-        if did_enrich:
-            raw = enriched
-            await page.aria_snapshot(mode="ai")
+        return await apply_snapshot_postprocessing(
+            page,
+            tree,
+            snapshot_format=snapshot_format,
+        )
+
+    settings = get_snapshot_settings()
+    raw = await page.aria_snapshot(mode="ai", depth=depth, boxes=boxes)
+    for _ in range(settings.iframe_retry_count):
+        if not _snapshot_needs_iframe_retry(raw):
+            break
+        await asyncio.sleep(settings.iframe_retry_delay_s)
+        raw = await page.aria_snapshot(mode="ai", depth=depth, boxes=boxes)
+
+    enriched, did_enrich, _iframe_unavailable = await _enrich_hollow_iframe_snapshots(
+        page,
+        raw,
+        depth=depth,
+        boxes=boxes,
+    )
+    if did_enrich:
+        raw = enriched
+        await page.aria_snapshot(mode="ai")
     tree = compress_snapshot(
         raw,
         include_urls=include_urls,
         max_url_len=max_url_len,
     )
-    formatted = apply_snapshot_format(tree, snapshot_format)
-    if snapshot_format == "interactive":
-        formatted = await enrich_interactables(page, formatted)
-    else:
-        formatted = await normalize_tree_roles_from_dom(page, formatted)
-    return formatted
+    return await apply_snapshot_postprocessing(
+        page,
+        tree,
+        snapshot_format=snapshot_format,
+    )
 
 
 async def capture_tree_snapshot(
@@ -1143,49 +1491,27 @@ async def snapshot_result(
     **extra: Any,
 ) -> dict[str, Any]:
     normalized_scope_ref = normalize_ref(scope_ref) if scope_ref else None
+    page_signals = await read_page_signals(page)
+    snapshot = await capture_page_snapshot(
+        page,
+        ref=normalized_scope_ref,
+        depth=depth,
+        boxes=boxes,
+        include_urls=include_urls,
+        max_url_len=max_url_len,
+        snapshot_format="tree",
+    )
     return {
         "page_id": page_id,
         "url": page.url,
         "title": await page.title(),
         "scope_ref": normalized_scope_ref,
-        "snapshot": await capture_page_snapshot(
-            page,
-            ref=normalized_scope_ref,
-            depth=depth,
-            boxes=boxes,
-            include_urls=include_urls,
-            max_url_len=max_url_len,
-            snapshot_format="tree",
-        ),
+        "signals": {
+            "dialog_count": page_signals["dialog_count"],
+            "iframe_hollow_count": snapshot.count(_IFRAME_UNAVAILABLE_SUFFIX),
+        },
+        "snapshot": snapshot,
         **extra,
-    }
-
-
-async def interactables_result(
-    page: Page,
-    page_id: str,
-    *,
-    scope_ref: str | None = None,
-    depth: int | None = None,
-    boxes: bool = False,
-    include_urls: bool = False,
-    max_url_len: int = DEFAULT_MAX_URL_LEN,
-) -> dict[str, Any]:
-    normalized_scope_ref = normalize_ref(scope_ref) if scope_ref else None
-    return {
-        "page_id": page_id,
-        "url": page.url,
-        "title": await page.title(),
-        "scope_ref": normalized_scope_ref,
-        "interactables": await capture_page_snapshot(
-            page,
-            ref=normalized_scope_ref,
-            depth=depth,
-            boxes=boxes,
-            include_urls=include_urls,
-            max_url_len=max_url_len,
-            snapshot_format="interactive",
-        ),
     }
 
 

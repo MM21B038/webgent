@@ -5,10 +5,10 @@ Playwright-based MCP server for headed browser automation. Built for AI agents t
 ## Features
 
 - **Headed Chromium** with persistent profiles under `profile/`
-- **Accessibility snapshots** — full YAML tree via `snapshot`, trimmed actionable tree via `interactables`
-- **Ref-based actions** — click, type, fill, select, upload, sliders, switches, tabs, and more
+- **Accessibility snapshots** — full YAML tree with refs via `snapshot`
+- **Ref-based actions** — click, fill, select, upload, and more
 - **Multi-tab sessions** — new tabs opened by clicks are registered automatically; action responses switch to the new active page
-- **Metadata-only action responses** — actions return `page_id`, `url`, `title`, and related fields; call `interactables` again to refresh refs after changes
+- **Metadata-only action responses** — actions return `page_id`, `url`, `title`, and related fields; call `snapshot` again to refresh refs after changes
 - **Screenshots** — viewport, full-page, or element captures saved under `media/`
 
 ## Requirements
@@ -37,16 +37,26 @@ display = ":0.0"
 [server]
 transport = "http"
 host = "127.0.0.1"
-port = 1234
+port = 3333
+
+[snapshot]
+list_threshold = 30
+list_head = 10
+list_tail = 10
+iframe_retry_count = 2
+iframe_retry_delay_s = 0.5
 
 [mcp.cursor]
-url = "http://127.0.0.1:1234/mcp"
+# url defaults to http://{server.host}:{server.port}/mcp when omitted
+server_info_resource = "webgent://server-info"
+prompt = "agent_system_prompt"
 ```
 
 - **`headless`** — `false` opens a visible Chromium window; `true` runs without a display (servers, SSH, CI).
 - **`display`** — X11 display for headed mode (e.g. `:0.0`). When set, webgent applies it before launching the browser. Leave empty to use the process `DISPLAY` env.
 - **`server`** — HTTP transport settings. The MCP endpoint is `http://{host}:{port}/mcp`.
-- **`mcp.cursor`** — suggested URL, MCP prompt name, and server-info resource URI for the Cursor MCP entry below.
+- **`snapshot`** — list truncation thresholds and iframe retry timing for snapshot capture.
+- **`mcp.cursor`** — MCP prompt name and server-info resource URI for the Cursor MCP entry below. Omit `url` to auto-derive from `server.host` and `server.port`.
 
 ## Run
 
@@ -56,7 +66,7 @@ Start the MCP server over HTTP:
 uv run webgent
 ```
 
-The server listens at `http://127.0.0.1:1234/mcp` by default (see `settings.toml`).
+The server listens at `http://127.0.0.1:3333/mcp` by default (see `settings.toml`).
 
 ### Cursor MCP config
 
@@ -66,7 +76,7 @@ Start `webgent` first, then add to your MCP settings using the URL from `setting
 {
   "mcpServers": {
     "webgent": {
-      "url": "http://127.0.0.1:1234/mcp"
+      "url": "http://127.0.0.1:3333/mcp"
     }
   }
 }
@@ -101,33 +111,42 @@ Read with `list_resources` / `read_resource`.
 ## Agent workflow
 
 1. **`create_session`** — start a browser session (optionally with `profile_name` and `initial_url`)
-2. **`interactables`** — get a trimmed tree of actionable elements with `[eN]` refs
-3. **Action** — `click`, `fill`, `select_option`, etc. using a ref from the latest interactables
-4. **`interactables`** again — refresh refs after navigation or DOM changes
+2. **`snapshot`** — get the full accessibility tree with `[ref=…]` markers
+3. **Action** — `click`, `fill`, `select_option`, etc. using a ref from the latest snapshot
+4. **`snapshot`** again — refresh refs after navigation or DOM changes
 5. **`close_session`** — shut down when done
 
-Use **`snapshot`** when you need the full accessibility tree (structure, text, roles). Use **`get_node`** to inspect one element in more detail.
+Use **`get_node`** to inspect one element in more detail when needed.
 
-### Interactables format
+### Snapshot format
 
-Non-actionable structure is kept as context; controls are compact lines with refs:
+The tree includes structure, text, headings, and interactive controls with refs. The **`snapshot`** response also includes **`signals`**: `dialog_count` and `iframe_hollow_count` for quick blocker detection.
 
 ```yaml
 - navigation "Links":
-  - [e1] link "Home" [cursor=pointer]
-  - [e2] link "About" [cursor=pointer]
+  - link "Home" [ref=e1] [cursor=pointer]
+  - link "About" [ref=e2] [cursor=pointer]
 - form:
-  - [e3] textbox "Email"
-  - [e4] combobox "Country" options="United States" | "United Kingdom"
-  - [e5] checkbox "Subscribe"
-  - [e6] radio "Pro plan"
-  - [e7] file "Upload file"
-  - [e8] button "Submit" [cursor=pointer]
+  - textbox "Email" [ref=e3] value="user@example.com"
+  - combobox "Country" [ref=e4] selected="us":
+    - option "Choose"
+    - option "United States" [selected]
+    - ... 25 options omitted ...
+    - option "Zimbabwe"
+  - checkbox "Subscribe" [ref=e5] checked=true
+  - radio "Pro plan" [ref=e6] checked=false
+  - file "Upload file" [ref=e7]
+  - button "Submit" [ref=e8] [cursor=pointer]
+- iframe [ref=e9] (content unavailable)
 ```
 
-Roles are resolved from the DOM where the accessibility tree is misleading — for example `<input type="file">` is labeled `file` (not `button`), and `<select>` dropdown options are inlined on combobox lines. Checkbox, radio, slider, switch, spinbutton, and other input types use their control role when present. The same DOM role resolution applies to **`snapshot`**, **`get_node`**, and **`interactables`**.
+**Enrichment** — inputs may show `value="…"`, `checked=true|false`, and `selected="…"` suffixes parsed from the live DOM.
 
-Pass `ref` to scope interactables to a subtree; pass `depth` to limit capture depth.
+**Truncation** — when a dropdown, repetitive rows, or inline `options=` list exceeds `list_threshold` (default 30), the middle collapses to `... N options omitted ...` while keeping the first/last 10 items; selected/checked entries are always preserved.
+
+Roles are resolved from the DOM where the accessibility tree is misleading — for example `<input type="file">` is labeled `file` (not `button`). The same DOM role resolution applies to **`snapshot`** and **`get_node`**.
+
+Pass `ref` to scope snapshot to a subtree; pass `depth` to limit capture depth.
 
 ### Action responses
 
@@ -156,7 +175,6 @@ When a click opens a new tab, `opened_new_page` is `true`, `previous_page_id` is
 | `add_page` | Open a new tab; optionally navigate to a URL |
 | `list_pages` | List tabs with `page_id`, `url`, `title`, `is_active` |
 | `switch_page` | Set the active tab |
-| `delete_page` | Close a tab (not the last one) |
 | `goto` | Navigate the active tab (or a given `page_id`) |
 | `close_session` | Close the session and all tabs |
 
@@ -164,8 +182,7 @@ When a click opens a new tab, `opened_new_page` is `true`, `previous_page_id` is
 
 | Tool | Description |
 |------|-------------|
-| `snapshot` | Full YAML accessibility tree |
-| `interactables` | Trimmed tree of actionable elements |
+| `snapshot` | Full YAML accessibility tree with signals and DOM-enriched state |
 | `get_node` | Role, name, states, value, checked, and a small subtree for one ref |
 | `get_url` | Full `href` for a link ref |
 | `screenshot` | Viewport, full-page, or element PNG/JPEG under `media/` |
@@ -201,17 +218,11 @@ All actions take `session_id`, `ref`, and optional `page_id`. Responses include 
 
 | Tool | Description |
 |------|-------------|
-| `click` | Click; falls back when overlays intercept pointer events |
-| `type` | Type into an editable element (`submit`, `slowly` optional) |
-| `fill` | Fill an input |
+| `click` | Click buttons, links, tabs, radios, and generic dismiss controls |
+| `fill` | Fill text inputs, sliders, spinbuttons, and date fields |
 | `select_option` | Select dropdown values |
-| `set_checkbox` | Set checkbox checked state |
-| `select_radio` | Select a radio option |
+| `set_checkbox` | Set checkbox or switch checked state |
 | `upload_files` | Upload to a file input (path or inline text) |
-| `set_slider` | Set a range/slider value |
-| `set_switch` | Set a switch checked state |
-| `set_spinbutton` | Set a number input value |
-| `select_tab` | Select a tab |
 
 ## Development
 
@@ -227,7 +238,7 @@ uv run python scripts/smoke_test.py
 webgent/
   server.py      MCP tool definitions
   browser.py     Session, page, and action logic
-  snapshot.py    Snapshots, interactables tree, ref helpers
+  snapshot.py    Snapshots, tree formatting, ref helpers
   screenshot.py  Screenshot capture
   captcha_ocr.py Captcha OCR via ddddocr
   files.py       Upload file resolution

@@ -24,13 +24,20 @@ transport = "http"
 host = "127.0.0.1"
 port = 3333
 
+[snapshot]
+# Collapse long option lists and repetitive rows when count exceeds list_threshold.
+list_threshold = 30
+list_head = 10
+list_tail = 10
+iframe_retry_count = 2
+iframe_retry_delay_s = 0.5
+
 [mcp.cursor]
-# Suggested Cursor MCP server entry — copy into Cursor MCP settings.
-url = "http://127.0.0.1:1234/mcp"
+# MCP URL defaults to http://{server.host}:{server.port}/mcp when url is omitted.
 server_info_resource = "webgent://server-info"
 prompt = "agent_system_prompt"
 
 [agent]
-llm_model = "DeepSeek"
-vlm_model = "VisionChat"
-emb_model = "Qwen3-Embedding-8B"
+llm_model = "openrouter/free"
+vlm_model = "openrouter/free"
+emb_model = "nvidia/llama-nemotron-embed-vl-1b-v2:free"

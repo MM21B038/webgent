@@ -13,10 +13,9 @@ from webgent.snapshot import (
     normalize_ref,
     parse_node_headline,
     to_interactive_snapshot,
+    truncate_repetitive_lists,
     truncate_url,
 )
-
-SERVER_PATH = Path(__file__).resolve().parent.parent / "webgent" / "server.py"
 
 LONG_LINK_URL = "https://example.com/" + ("segment/" * 20) + "target?tracking=abcdef"
 LINKS_PAGE_URL = (
@@ -336,6 +335,87 @@ def test_interactive_snapshot_helpers() -> None:
     print("interactive snapshot helpers test passed")
 
 
+def test_list_truncation_helpers() -> None:
+    option_lines = "\n".join(
+        f'  - option "Item {index}"'
+        + (" [selected]" if index == 20 else "")
+        for index in range(35)
+    )
+    combobox_tree = f'- combobox "Items" [ref=e1]:\n{option_lines}'
+    truncated = truncate_repetitive_lists(
+        combobox_tree,
+        threshold=30,
+        head=10,
+        tail=10,
+    )
+    assert "options omitted" in truncated
+    assert 'option "Item 0"' in truncated
+    assert 'option "Item 34"' in truncated
+    assert 'option "Item 20"' in truncated
+    assert 'option "Item 15"' not in truncated
+
+    inline_options = " | ".join(f'"Opt{index}"' for index in range(40))
+    inline_line = f'- combobox "Country" [ref=e4] options={inline_options}'
+    truncated_inline = truncate_repetitive_lists(
+        inline_line,
+        threshold=30,
+        head=10,
+        tail=10,
+    )
+    assert "options omitted" in truncated_inline
+    assert '"Opt0"' in truncated_inline
+    assert '"Opt39"' in truncated_inline
+
+    row_lines = "\n".join(
+        f'  - row "Row {index}" [ref=e{index + 2}]' for index in range(35)
+    )
+    table_tree = f'- table [ref=e1]:\n{row_lines}'
+    truncated_rows = truncate_repetitive_lists(
+        table_tree,
+        threshold=30,
+        head=10,
+        tail=10,
+    )
+    assert "... 14 row omitted ..." in truncated_rows or "omitted" in truncated_rows
+    assert 'row "Row 0"' in truncated_rows
+    assert 'row "Row 34"' in truncated_rows
+    assert 'row "Row 15"' not in truncated_rows
+    print("list truncation helpers test passed")
+
+
+async def test_state_enrichment_helpers() -> None:
+    manager = BrowserManager()
+    await manager.start()
+    try:
+        session_info = await manager.create_session(
+            "enrichment-test",
+            initial_url=FORM_PAGE_URL,
+        )
+        session = manager.get_session(session_info["session_id"])
+        snapshot = await session.page_snapshot()
+        assert "signals" in snapshot
+        assert "dialog_count" in snapshot["signals"]
+        assert "iframe_hollow_count" in snapshot["signals"]
+        assert snapshot["signals"]["iframe_hollow_count"] == 0
+
+        email_ref = find_ref(snapshot["snapshot"], "textbox", "email")
+        assert email_ref is not None
+        await session.fill_field(email_ref, "enriched@example.com")
+        enriched = await session.page_snapshot()
+        assert 'value="enriched@example.com"' in enriched["snapshot"]
+
+        checkbox_ref = find_ref(enriched["snapshot"], "checkbox", "subscribe")
+        assert checkbox_ref is not None
+        await session.set_checkbox(checkbox_ref, True)
+        checked_snapshot = await session.page_snapshot()
+        assert "checked=true" in checked_snapshot["snapshot"].lower()
+
+        await manager.close_session(session_info["session_id"])
+        print("state enrichment helpers test passed")
+    finally:
+        await manager.stop()
+
+
 async def test_snapshot_role_normalization() -> None:
     from playwright.async_api import async_playwright
 
@@ -433,9 +513,9 @@ async def test_cross_frame_refs() -> None:
         session = manager.get_session(session_info["session_id"])
         await asyncio.sleep(0.3)
 
-        interactables = await session.page_interactables()
-        close_ref = find_ref(interactables["interactables"], "button", "close")
-        assert close_ref is not None, interactables["interactables"]
+        interactables = await session.page_snapshot()
+        close_ref = find_ref(interactables["snapshot"], "button", "close")
+        assert close_ref is not None, interactables["snapshot"]
 
         clicked = await session.click(close_ref)
         assert clicked["ref"] == close_ref
@@ -487,8 +567,8 @@ async def test_vision_query() -> None:
         assert success["response"] == "Vision Test"
         assert success["mode"] == "viewport"
 
-        interactables = await session.page_interactables()
-        img_ref = find_ref(interactables["interactables"], "img", "vision test")
+        interactables = await session.page_snapshot()
+        img_ref = find_ref(interactables["snapshot"], "img", "vision test")
         assert img_ref is not None
         with patch("webgent.browser.query_vlm", return_value="Vision Test"):
             element_result = await session.vision_query(
@@ -540,17 +620,6 @@ async def test_browser_manager() -> None:
         assert len(page_snapshot["snapshot"]) > 0
         assert "[ref=" in page_snapshot["snapshot"]
 
-        interactables = await session.page_interactables()
-        assert "interactables" in interactables
-        assert isinstance(interactables["interactables"], str)
-        assert len(interactables["interactables"]) > 0
-        interactables_text = interactables["interactables"]
-        assert interactables_text.splitlines()[0].startswith("- ")
-        assert any(
-            extract_ref_from_line(line) is not None
-            for line in interactables_text.splitlines()
-        )
-
         screenshot_result = await session.take_screenshot()
         assert screenshot_result["mode"] == "viewport"
         assert screenshot_result["path"].endswith(".png")
@@ -562,8 +631,8 @@ async def test_browser_manager() -> None:
         assert Path(full_page_result["path"]).exists()
 
         await session.goto(CAPTCHA_PAGE_URL)
-        captcha_interactables = await session.page_interactables()
-        captcha_ref = find_ref(captcha_interactables["interactables"], "img", "captcha")
+        captcha_interactables = await session.page_snapshot()
+        captcha_ref = find_ref(captcha_interactables["snapshot"], "img", "captcha")
         assert captcha_ref is not None
         captcha_result = await session.captcha_ocr(captcha_ref)
         assert captcha_result["ref"] == captcha_ref
@@ -587,13 +656,13 @@ async def test_browser_manager() -> None:
             '<img alt="Logo" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">'
             "</body></html>"
         )
-        img_interactables = await session.page_interactables()
-        img_ref = find_ref(img_interactables["interactables"], "img", "logo")
+        img_interactables = await session.page_snapshot()
+        img_ref = find_ref(img_interactables["snapshot"], "img", "logo")
         assert img_ref is not None
 
         await session.goto(FORM_PAGE_URL)
-        form_interactables = await session.page_interactables()
-        interactables_text = form_interactables["interactables"]
+        form_interactables = await session.page_snapshot()
+        interactables_text = form_interactables["snapshot"]
         email_ref = find_ref(interactables_text, "textbox", "email")
         country_ref = find_ref(interactables_text, "combobox", "country")
         checkbox_ref = find_ref(interactables_text, "checkbox", "subscribe")
@@ -601,14 +670,8 @@ async def test_browser_manager() -> None:
         assert email_ref and country_ref and checkbox_ref and radio_ref
         assert any("checkbox" in line for line in interactables_text.splitlines())
         assert any("radio" in line for line in interactables_text.splitlines())
-        country_line = next(
-            line
-            for line in form_interactables["interactables"].splitlines()
-            if country_ref in line
-        )
-        assert "options=" in country_line
-        assert "United States" in country_line
-        assert "United Kingdom" in country_line
+        assert "United States" in interactables_text
+        assert "United Kingdom" in interactables_text
 
         node = await session.get_node(email_ref)
         assert node["ref"] == email_ref
@@ -626,16 +689,16 @@ async def test_browser_manager() -> None:
         assert selected["values"] == ["United States"]
         checked = await session.set_checkbox(checkbox_ref, True)
         assert checked["checked"] is True
-        radio = await session.select_radio(radio_ref)
-        assert radio["checked"] is True
+        radio = await session.click(radio_ref)
+        assert radio["ref"] == radio_ref
 
         await session.goto(UPLOAD_PAGE_URL)
-        upload_interactables = await session.page_interactables()
-        upload_ref = find_ref(upload_interactables["interactables"], "file", "upload")
+        upload_interactables = await session.page_snapshot()
+        upload_ref = find_ref(upload_interactables["snapshot"], "file", "upload")
         if upload_ref is None:
-            upload_ref = find_ref(upload_interactables["interactables"], "button", "upload")
+            upload_ref = find_ref(upload_interactables["snapshot"], "button", "upload")
         if upload_ref is None:
-            upload_ref = find_ref(upload_interactables["interactables"], "input", "upload")
+            upload_ref = find_ref(upload_interactables["snapshot"], "input", "upload")
         assert upload_ref is not None
 
         with tempfile.NamedTemporaryFile(
@@ -658,12 +721,12 @@ async def test_browser_manager() -> None:
             Path(disk_path).unlink(missing_ok=True)
 
         await session.goto(UPLOAD_PAGE_URL)
-        upload_interactables = await session.page_interactables()
-        upload_ref = find_ref(upload_interactables["interactables"], "file", "upload")
+        upload_interactables = await session.page_snapshot()
+        upload_ref = find_ref(upload_interactables["snapshot"], "file", "upload")
         if upload_ref is None:
-            upload_ref = find_ref(upload_interactables["interactables"], "button", "upload")
+            upload_ref = find_ref(upload_interactables["snapshot"], "button", "upload")
         if upload_ref is None:
-            upload_ref = find_ref(upload_interactables["interactables"], "input", "upload")
+            upload_ref = find_ref(upload_interactables["snapshot"], "input", "upload")
         inline_upload = await session.upload_files(
             upload_ref,
             text="hello upload",
@@ -673,9 +736,9 @@ async def test_browser_manager() -> None:
         assert inline_upload["files"] == ["hello.txt"]
 
         await session.goto(LINKS_PAGE_URL)
-        links_interactables = await session.page_interactables()
+        links_interactables = await session.page_snapshot()
         assert links_interactables["scope_ref"] is None
-        link_ref = find_ref(links_interactables["interactables"], "long")
+        link_ref = find_ref(links_interactables["snapshot"], "long")
         assert link_ref is not None
 
         links_with_urls = await session.page_snapshot(
@@ -688,15 +751,10 @@ async def test_browser_manager() -> None:
         full_url = await session.get_link_url(link_ref)
         assert full_url["url"] == LONG_LINK_URL
 
-        nav_ref = find_ref(links_interactables["interactables"], "long")
-        subtree = await session.page_interactables(ref=nav_ref)
+        nav_ref = find_ref(links_interactables["snapshot"], "long")
+        subtree = await session.page_snapshot(ref=nav_ref)
         assert subtree["scope_ref"] == nav_ref
-        assert len(subtree["interactables"]) <= len(links_interactables["interactables"])
-
-        second_page_id = added["page_id"]
-        await session.delete_page(second_page_id)
-        pages = await session.list_pages()
-        assert len(pages["pages"]) == 1
+        assert len(subtree["snapshot"]) <= len(links_interactables["snapshot"])
 
         closed = await manager.close_session(session_id)
         assert closed["closed"] is True
@@ -716,8 +774,8 @@ async def test_action_metadata_only() -> None:
         session = manager.get_session(session_info["session_id"])
 
         await session.goto(FORM_PAGE_URL)
-        interactables = await session.page_interactables()
-        email_ref = find_ref(interactables["interactables"], "textbox", "email")
+        interactables = await session.page_snapshot()
+        email_ref = find_ref(interactables["snapshot"], "textbox", "email")
         assert email_ref
 
         filled = await session.fill_field(email_ref, "scoped@example.com")
@@ -728,8 +786,8 @@ async def test_action_metadata_only() -> None:
         assert "major_change" not in filled
 
         await session.goto(NAV_PAGE_URL)
-        nav_interactables = await session.page_interactables()
-        link_ref = find_ref(nav_interactables["interactables"], "navigate")
+        nav_interactables = await session.page_snapshot()
+        link_ref = find_ref(nav_interactables["snapshot"], "navigate")
         assert link_ref is not None
         before_url = nav_interactables["url"]
         navigated = await session.click(link_ref)
@@ -740,9 +798,9 @@ async def test_action_metadata_only() -> None:
         assert navigated["page_id"] == navigated["active_page_id"]
 
         await session.goto(NEW_TAB_PAGE_URL)
-        tab_page_interactables = await session.page_interactables()
+        tab_page_interactables = await session.page_snapshot()
         before_page_id = tab_page_interactables["page_id"]
-        new_tab_ref = find_ref(tab_page_interactables["interactables"], "open", "new", "tab")
+        new_tab_ref = find_ref(tab_page_interactables["snapshot"], "open", "new", "tab")
         assert new_tab_ref is not None
         opened = await session.click(new_tab_ref)
         assert opened["opened_new_page"] is True
@@ -754,9 +812,9 @@ async def test_action_metadata_only() -> None:
         assert len(pages["pages"]) == 2
 
         await session.goto(DIALOG_PAGE_URL)
-        dialog_interactables = await session.page_interactables()
+        dialog_interactables = await session.page_snapshot()
         button_ref = find_ref(
-            dialog_interactables["interactables"], "button", "open", "dialog"
+            dialog_interactables["snapshot"], "button", "open", "dialog"
         )
         assert button_ref is not None
         opened = await session.click(button_ref)
@@ -764,38 +822,28 @@ async def test_action_metadata_only() -> None:
         assert "snapshot" not in opened
 
         await session.goto(OVERLAY_SELECT_PAGE_URL)
-        overlay_interactables = await session.page_interactables()
-        sort_ref = find_ref(overlay_interactables["interactables"], "combobox", "sort")
+        overlay_interactables = await session.page_snapshot()
+        sort_ref = find_ref(overlay_interactables["snapshot"], "combobox", "sort")
         assert sort_ref is not None
-        sort_line = next(
-            line
-            for line in overlay_interactables["interactables"].splitlines()
-            if sort_ref in line
-        )
-        assert "Price: Low to High" in sort_line
-        assert "Price: High to Low" in sort_line
+        overlay_snapshot = overlay_interactables["snapshot"]
+        assert "Price: Low to High" in overlay_snapshot
+        assert "Price: High to Low" in overlay_snapshot
         clicked_sort = await session.click(sort_ref)
         assert clicked_sort["ref"] == sort_ref
 
         await session.goto(AMAZON_SORT_PAGE_URL)
-        amazon_interactables = await session.page_interactables()
+        amazon_interactables = await session.page_snapshot()
         amazon_sort_ref = find_ref(
-            amazon_interactables["interactables"], "combobox", "sort"
+            amazon_interactables["snapshot"], "combobox", "sort"
         )
         assert amazon_sort_ref is not None
-        amazon_sort_line = next(
-            line
-            for line in amazon_interactables["interactables"].splitlines()
-            if amazon_sort_ref in line
-        )
-        assert "Price: Low to High" in amazon_sort_line
-        assert "Price: High to Low" in amazon_sort_line
-
-        assert "Price: High to Low" in amazon_sort_line
+        amazon_snapshot = amazon_interactables["snapshot"]
+        assert "Price: Low to High" in amazon_snapshot
+        assert "Price: High to Low" in amazon_snapshot
 
         await session.goto(FULL_CONTROLS_PAGE_URL)
-        controls = await session.page_interactables()
-        controls_text = controls["interactables"]
+        controls = await session.page_snapshot()
+        controls_text = controls["snapshot"]
         for role_keyword in (
             "textbox",
             "checkbox",
@@ -815,22 +863,22 @@ async def test_action_metadata_only() -> None:
         tab_ref = find_ref(controls_text, "tab", "details")
         assert slider_ref and switch_ref and spinbutton_ref and tab_ref
 
-        slider_result = await session.set_slider(slider_ref, 75)
+        slider_result = await session.fill_field(slider_ref, "75")
         assert slider_result["value"] == "75"
-        switch_result = await session.set_switch(switch_ref, True)
+        switch_result = await session.set_checkbox(switch_ref, True)
         assert switch_result["checked"] is True
-        spin_result = await session.set_spinbutton(spinbutton_ref, 5)
+        spin_result = await session.fill_field(spinbutton_ref, "5")
         assert spin_result["value"] == "5"
-        tab_result = await session.select_tab(tab_ref)
+        tab_result = await session.click(tab_ref)
         assert tab_result["ref"] == tab_ref
 
         await session.goto(SEARCH_TYPE_PAGE_URL)
-        search_interactables = await session.page_interactables(depth=3)
-        search_ref = find_ref(search_interactables["interactables"], "search")
+        search_interactables = await session.page_snapshot(depth=3)
+        search_ref = find_ref(search_interactables["snapshot"], "search")
         assert search_ref is not None
-        typed = await session.type_text(search_ref, "laptop")
+        typed = await session.fill_field(search_ref, "laptop")
         assert typed["ref"] == search_ref
-        assert typed["text"] == "laptop"
+        assert typed["value"] == "laptop"
         assert "snapshot" not in typed
 
         await manager.close_session(session_info["session_id"])
@@ -872,8 +920,8 @@ async def test_fill_verifies_dom_value() -> None:
             initial_url=FORM_PAGE_URL,
         )
         session = manager.get_session(session_info["session_id"])
-        interactables = await session.page_interactables()
-        email_ref = find_ref(interactables["interactables"], "textbox", "email")
+        interactables = await session.page_snapshot()
+        email_ref = find_ref(interactables["snapshot"], "textbox", "email")
         assert email_ref
 
         filled = await session.fill_field(email_ref, "verified@example.com")
@@ -882,8 +930,8 @@ async def test_fill_verifies_dom_value() -> None:
         assert node["value"] == "verified@example.com"
 
         await session.goto(READONLY_INPUT_PAGE_URL)
-        readonly_interactables = await session.page_interactables()
-        locked_ref = find_ref(readonly_interactables["interactables"], "locked")
+        readonly_interactables = await session.page_snapshot()
+        locked_ref = find_ref(readonly_interactables["snapshot"], "locked")
         assert locked_ref is not None
         try:
             await session.fill_field(locked_ref, "should-fail")
@@ -892,8 +940,8 @@ async def test_fill_verifies_dom_value() -> None:
             assert "readonly" in str(exc).lower()
 
         await session.goto(JQUERY_DATEPICKER_PAGE_URL)
-        date_interactables = await session.page_interactables()
-        dob_ref = find_ref(date_interactables["interactables"], "date", "birth")
+        date_interactables = await session.page_snapshot()
+        dob_ref = find_ref(date_interactables["snapshot"], "date", "birth")
         assert dob_ref is not None
         filled_dob = await session.fill_field(dob_ref, "15-06-1990")
         assert filled_dob["value"] == "15-06-1990"
@@ -965,8 +1013,8 @@ async def test_network_capture() -> None:
         assert "[ref=" in response["body"]
 
         await session.goto(FETCH_PAGE_URL)
-        interactables = await session.page_interactables()
-        fetch_ref = find_ref(interactables["interactables"], "button", "fetch data")
+        interactables = await session.page_snapshot()
+        fetch_ref = find_ref(interactables["snapshot"], "button", "fetch data")
         assert fetch_ref is not None
         clicked = await session.click(fetch_ref, capture_requests=True)
         xhr_requests = [
@@ -978,8 +1026,8 @@ async def test_network_capture() -> None:
         assert xhr_requests[0]["method"] == "GET"
 
         await session.goto(POST_FETCH_PAGE_URL)
-        post_interactables = await session.page_interactables()
-        post_ref = find_ref(post_interactables["interactables"], "button", "post data")
+        post_interactables = await session.page_snapshot()
+        post_ref = find_ref(post_interactables["snapshot"], "button", "post data")
         assert post_ref is not None
         posted = await session.click(post_ref, capture_requests=True)
         post_requests = [
@@ -997,10 +1045,10 @@ async def test_network_capture() -> None:
         assert post_body["size"] > 0
 
         await session.goto(FORM_UPLOAD_POST_PAGE_URL)
-        upload_interactables = await session.page_interactables()
-        file_ref = find_ref(upload_interactables["interactables"], "file", "file")
+        upload_interactables = await session.page_snapshot()
+        file_ref = find_ref(upload_interactables["snapshot"], "file", "file")
         submit_ref = find_ref(
-            upload_interactables["interactables"],
+            upload_interactables["snapshot"],
             "button",
             "upload submit",
         )
@@ -1124,8 +1172,8 @@ async def test_page_inspect_and_http_tools() -> None:
         assert form_data["form"]["fields"]["_token"] == "tok-abc"
         assert form_data["form"]["fields"]["email"] == ""
 
-        interactables = await session.page_interactables()
-        assert "_token" not in interactables["interactables"]
+        interactables = await session.page_snapshot()
+        assert "_token" not in interactables["snapshot"]
 
         evaluated = await session.evaluate_js(
             '() => document.querySelector("meta[name=csrf-token]").content'
@@ -1182,7 +1230,7 @@ async def test_page_inspect_and_http_tools() -> None:
 
         await session.goto(URLENCODED_FORM_PAGE_URL)
         submit_ref = find_ref(
-            (await session.page_interactables())["interactables"],
+            (await session.page_snapshot())["snapshot"],
             "button",
             "submit encoded",
         )
@@ -1221,17 +1269,20 @@ async def test_page_inspect_and_http_tools() -> None:
 
 
 async def test_mcp_tools() -> None:
-    async with Client(str(SERVER_PATH)) as client:
+    from webgent.server import mcp
+
+    async with Client(mcp) as client:
         prompts = await client.list_prompts()
         prompt_names = {item.name for item in prompts}
         assert "agent_system_prompt" in prompt_names
 
         prompt_result = await client.get_prompt("agent_system_prompt")
         prompt_text = prompt_result.messages[0].content.text
-        assert "interactable" in prompt_text.lower() or "interactables" in prompt_text.lower()
+        assert "snapshot" in prompt_text.lower()
+        assert "webgent" in prompt_text.lower()
 
         resources = await client.list_resources()
-        resource_uris = {resource.uri for resource in resources}
+        resource_uris = {str(resource.uri) for resource in resources}
         assert "webgent://server-info" in resource_uris
         assert "webgent://prompt" not in resource_uris
 
@@ -1246,26 +1297,16 @@ async def test_mcp_tools() -> None:
             "create_session",
             "add_page",
             "list_pages",
-            "delete_page",
             "switch_page",
             "goto",
-            "go_back",
-            "go_forward",
             "close_session",
             "snapshot",
-            "interactables",
             "get_node",
             "click",
-            "type",
             "fill",
             "select_option",
             "set_checkbox",
-            "select_radio",
             "upload_files",
-            "set_slider",
-            "set_switch",
-            "set_spinbutton",
-            "select_tab",
             "get_url",
             "screenshot",
             "captcha_ocr",
@@ -1320,15 +1361,18 @@ async def test_mcp_tools() -> None:
         )
         assert "snapshot" in result.data
         assert "[ref=" in result.data["snapshot"]
+        assert "signals" in result.data
+        assert "dialog_count" in result.data["signals"]
+        assert "iframe_hollow_count" in result.data["signals"]
 
         result = await client.call_tool(
-            "interactables",
+            "snapshot",
             {"session_id": session_id},
         )
-        assert "interactables" in result.data
+        assert "snapshot" in result.data
         assert any(
             extract_ref_from_line(line) is not None
-            for line in result.data["interactables"].splitlines()
+            for line in result.data["snapshot"].splitlines()
         )
 
         result = await client.call_tool(
@@ -1340,25 +1384,25 @@ async def test_mcp_tools() -> None:
         )
 
         result = await client.call_tool(
-            "interactables",
+            "snapshot",
             {"session_id": session_id},
         )
-        snapshot_text = result.data["interactables"]
+        snapshot_text = result.data["snapshot"]
         ref_match = find_ref(snapshot_text, "textbox", "search")
-        assert ref_match is not None, f"expected a textbox ref in interactables:\n{snapshot_text}"
+        assert ref_match is not None, f"expected a textbox ref in snapshot:\n{snapshot_text}"
         button_ref = find_ref(snapshot_text, "button")
-        assert button_ref is not None, "expected a button ref in interactables"
+        assert button_ref is not None, "expected a button ref in snapshot"
 
         result = await client.call_tool(
-            "type",
+            "fill",
             {
                 "session_id": session_id,
                 "ref": ref_match,
-                "text": "webgent",
+                "value": "webgent",
             },
         )
         assert result.data["ref"] == ref_match
-        assert result.data["text"] == "webgent"
+        assert result.data["value"] == "webgent"
         assert "snapshot" not in result.data
 
         result = await client.call_tool(
@@ -1400,8 +1444,8 @@ async def test_mcp_tools() -> None:
             "goto",
             {"session_id": session_id, "url": CAPTCHA_PAGE_URL},
         )
-        result = await client.call_tool("interactables", {"session_id": session_id})
-        captcha_ref = find_ref(result.data["interactables"], "img", "captcha")
+        result = await client.call_tool("snapshot", {"session_id": session_id})
+        captcha_ref = find_ref(result.data["snapshot"], "img", "captcha")
         assert captcha_ref is not None
         result = await client.call_tool(
             "captcha_ocr",
@@ -1433,8 +1477,8 @@ async def test_mcp_tools() -> None:
             "goto",
             {"session_id": session_id, "url": FORM_PAGE_URL},
         )
-        result = await client.call_tool("interactables", {"session_id": session_id})
-        form_snapshot = result.data["interactables"]
+        result = await client.call_tool("snapshot", {"session_id": session_id})
+        form_snapshot = result.data["snapshot"]
         email_ref = find_ref(form_snapshot, "textbox", "email")
         country_ref = find_ref(form_snapshot, "combobox", "country")
         checkbox_ref = find_ref(form_snapshot, "checkbox", "subscribe")
@@ -1472,21 +1516,21 @@ async def test_mcp_tools() -> None:
         assert result.data["checked"] is True
 
         result = await client.call_tool(
-            "select_radio",
+            "click",
             {"session_id": session_id, "ref": radio_ref},
         )
-        assert result.data["checked"] is True
+        assert result.data["ref"] == radio_ref
 
         result = await client.call_tool(
             "goto",
             {"session_id": session_id, "url": UPLOAD_PAGE_URL},
         )
-        result = await client.call_tool("interactables", {"session_id": session_id})
-        upload_ref = find_ref(result.data["interactables"], "file", "upload")
+        result = await client.call_tool("snapshot", {"session_id": session_id})
+        upload_ref = find_ref(result.data["snapshot"], "file", "upload")
         if upload_ref is None:
-            upload_ref = find_ref(result.data["interactables"], "button", "upload")
+            upload_ref = find_ref(result.data["snapshot"], "button", "upload")
         if upload_ref is None:
-            upload_ref = find_ref(result.data["interactables"], "input", "upload")
+            upload_ref = find_ref(result.data["snapshot"], "input", "upload")
         assert upload_ref is not None
 
         result = await client.call_tool(
@@ -1515,12 +1559,12 @@ async def test_mcp_tools() -> None:
                 "goto",
                 {"session_id": session_id, "url": UPLOAD_PAGE_URL},
             )
-            result = await client.call_tool("interactables", {"session_id": session_id})
-            upload_ref = find_ref(result.data["interactables"], "file", "upload")
+            result = await client.call_tool("snapshot", {"session_id": session_id})
+            upload_ref = find_ref(result.data["snapshot"], "file", "upload")
             if upload_ref is None:
-                upload_ref = find_ref(result.data["interactables"], "button", "upload")
+                upload_ref = find_ref(result.data["snapshot"], "button", "upload")
             if upload_ref is None:
-                upload_ref = find_ref(result.data["interactables"], "input", "upload")
+                upload_ref = find_ref(result.data["snapshot"], "input", "upload")
             assert upload_ref is not None
 
             result = await client.call_tool(
@@ -1540,9 +1584,9 @@ async def test_mcp_tools() -> None:
             "goto",
             {"session_id": session_id, "url": LINKS_PAGE_URL},
         )
-        result = await client.call_tool("interactables", {"session_id": session_id})
+        result = await client.call_tool("snapshot", {"session_id": session_id})
         assert result.data["scope_ref"] is None
-        link_ref = find_ref(result.data["interactables"], "long")
+        link_ref = find_ref(result.data["snapshot"], "long")
         assert link_ref is not None
 
         result = await client.call_tool(
@@ -1563,16 +1607,10 @@ async def test_mcp_tools() -> None:
         assert result.data["url"] == LONG_LINK_URL
 
         result = await client.call_tool(
-            "interactables",
+            "snapshot",
             {"session_id": session_id, "ref": link_ref},
         )
         assert result.data["scope_ref"] == link_ref
-
-        result = await client.call_tool(
-            "delete_page",
-            {"session_id": session_id, "page_id": second_page_id},
-        )
-        assert result.data["active_page_id"] == page_id
 
         result = await client.call_tool(
             "goto",
@@ -1583,6 +1621,7 @@ async def test_mcp_tools() -> None:
             },
         )
         assert "requests" in result.data
+        assert "capture_hint" in result.data
         request_id = assert_request_summaries(result.data["requests"])
 
         result = await client.call_tool(
@@ -1639,6 +1678,17 @@ async def test_tool_errors_as_responses() -> None:
     assert runtime.structured_content["error_type"] == "ValueError"
     assert "runtime failure" in runtime.structured_content["error"]
 
+    from webgent.snapshot import ActionError
+
+    @app.tool
+    @wrap_tool_result
+    async def raises_action_error() -> dict:
+        raise ActionError("ref missing", hint="Run snapshot to refresh refs")
+
+    action_error = await app.call_tool("raises_action_error", {})
+    assert action_error.structured_content["error_type"] == "ActionError"
+    assert action_error.structured_content["hint"] == "Run snapshot to refresh refs"
+
     invalid = await app.call_tool(
         "bad_args",
         {"unexpected": "value"},
@@ -1657,12 +1707,14 @@ async def test_tool_errors_as_responses() -> None:
 async def main() -> None:
     test_compress_snapshot_helpers()
     test_interactive_snapshot_helpers()
+    test_list_truncation_helpers()
     await test_snapshot_role_normalization()
     await test_cross_frame_refs()
     await test_vision_query()
     await test_browser_manager()
     await test_action_metadata_only()
     await test_fill_verifies_dom_value()
+    await test_state_enrichment_helpers()
     await test_network_capture()
     await test_request_registry()
     await test_page_inspect_and_http_tools()

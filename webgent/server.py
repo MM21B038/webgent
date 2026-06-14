@@ -96,58 +96,54 @@ CREATE_SESSION_DOC = (
 )
 ADD_PAGE_DOC = "Open a new tab; optionally go to url." + _CAPTURE_DOC
 LIST_PAGES_DOC = "List tabs with page_id, url, title, and is_active."
-DELETE_PAGE_DOC = "Close a tab (not the last one in the session)."
 SWITCH_PAGE_DOC = "Set the active tab."
 GOTO_DOC = (
     "Go to url. Clears snapshot scope; does not return a snapshot." + _CAPTURE_DOC
 )
-GO_BACK_DOC = (
-    "Go back in browser history. Clears snapshot scope; does not return a snapshot."
-    + _CAPTURE_DOC
-)
-GO_FORWARD_DOC = (
-    "Go forward in browser history. Clears snapshot scope; does not return a snapshot."
-    + _CAPTURE_DOC
-)
 CLOSE_SESSION_DOC = "Close the session and all tabs."
 SNAPSHOT_DOC = (
-    "Full YAML accessibility tree. ref scopes capture; omit depth for unlimited depth."
-)
-INTERACTABLES_DOC = (
-    "Trimmed YAML tree of actionable elements: structural parents (navigation, form, dialog) "
-    "wrap compact [eN] role \"name\" lines for buttons, links, inputs, checkboxes, radios, "
-    "file uploads, comboboxes, sliders, tabs, images, and similar controls. "
-    "Combobox/listbox lines include options=. ref scopes capture; omit depth for unlimited depth."
+    "Full YAML accessibility tree with [ref=…] markers. "
+    "Returns signals.dialog_count and signals.iframe_hollow_count for blockers. "
+    "Enriched lines include value=, checked=, and selected= suffixes. "
+    "Long option lists collapse to first 10 + ... N omitted ... + last 10; "
+    "selected/checked items stay visible. "
+    "ref scopes capture; omit depth for unlimited depth. "
+    "Always call snapshot after navigation or any action failure."
 )
 GET_NODE_DOC = (
-    "Get role, name, states, value, checked, and a small subtree for one ref. "
-    "Role is resolved from the DOM (file, checkbox, radio, combobox, etc.). "
-    "depth defaults to 3 unless passed."
+    "Inspect one ref: role, name, states, value, checked, and a scoped subtree "
+    "(same truncation and enrichment as snapshot). "
+    "Use for deep inspection; prefer snapshot for the full page."
 )
 GET_URL_DOC = "Get the full href for a link ref."
 CLICK_DOC = (
-    "Click by ref; falls back when a visible overlay intercepts pointer events. "
+    "Click by ref (button, tab, radio, link, or generic). "
+    "Falls back when a visible overlay intercepts pointer events. "
+    "On failure, check error hint and run snapshot to find blockers. "
     + _ACTION_DOC
     + _CAPTURE_DOC
 )
-TYPE_DOC = "Type into an editable element by ref. " + _ACTION_DOC + _CAPTURE_DOC
 FILL_DOC = (
-    "Fill an input by ref; verifies the value was written to the DOM. "
-    "Readonly jQuery UI / flatpickr / native date inputs accept dd-mm-yyyy or yyyy-mm-dd. "
+    "Fill textbox, searchbox, textarea, spinbutton, slider, or date field by ref. "
+    "Verifies the value was written; check returned value. "
+    "slowly=true types character-by-character; submit=true presses Enter after fill. "
+    "Readonly date pickers accept dd-mm-yyyy or yyyy-mm-dd. "
     + _ACTION_DOC
     + _CAPTURE_DOC
 )
-SELECT_OPTION_DOC = "Select dropdown values by ref. " + _ACTION_DOC + _CAPTURE_DOC
-SET_CHECKBOX_DOC = "Set checkbox checked state by ref. " + _ACTION_DOC + _CAPTURE_DOC
-SELECT_RADIO_DOC = "Select a radio option by ref. " + _ACTION_DOC + _CAPTURE_DOC
-UPLOAD_FILES_DOC = "Upload to a file input by ref. " + _ACTION_DOC + _CAPTURE_DOC
-SET_SLIDER_DOC = "Set a slider/range input value by ref. " + _ACTION_DOC + _CAPTURE_DOC
-SET_SWITCH_DOC = "Set a switch checked state by ref. " + _ACTION_DOC + _CAPTURE_DOC
-SET_SPINBUTTON_DOC = (
-    "Set a spinbutton/number input value by ref. " + _ACTION_DOC + _CAPTURE_DOC
+SELECT_OPTION_DOC = (
+    "Select combobox or listbox values by ref. " + _ACTION_DOC + _CAPTURE_DOC
 )
-SELECT_TAB_DOC = "Select a tab by ref. " + _ACTION_DOC + _CAPTURE_DOC
-SCREENSHOT_DOC = "Save a viewport, full-page, or element PNG/JPEG under media/."
+SET_CHECKBOX_DOC = (
+    "Set checkbox or switch checked state by ref (checked true/false). "
+    + _ACTION_DOC
+    + _CAPTURE_DOC
+)
+UPLOAD_FILES_DOC = "Upload to a file input by ref. " + _ACTION_DOC + _CAPTURE_DOC
+SCREENSHOT_DOC = (
+    "Save a viewport, full-page, or element PNG/JPEG under media/. "
+    "Do not use unless the user explicitly asks for a screenshot."
+)
 CAPTCHA_OCR_DOC = (
     "Screenshot a captcha image element by ref and recognize captcha text. "
     "mode=ddddocr uses ddddocr only; mode=vlm uses the configured VLM agent "
@@ -169,6 +165,7 @@ GET_CAPTURED_RESPONSE_DOC = (
     "Get response body for a captured or registered request id. "
     "HTML responses are returned as parsed snapshot YAML when format=tree; "
     "format=raw returns the original response text. "
+    "Use after capture_requests=true actions; see capture_hint on the action response. "
     "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
     "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
 )
@@ -189,7 +186,8 @@ SET_COOKIES_DOC = (
 HTTP_REQUEST_DOC = (
     "Send an HTTP request using the session cookie jar via context.request. "
     "Supports raw body, form data dict, or json dict. "
-    "HTML responses use format=tree for snapshot YAML or format=raw for text."
+    "HTML responses use format=tree for snapshot YAML or format=raw for text. "
+    "Prefer browser login (fill + click with capture_requests) when page JS handles encryption."
 )
 ENCRYPT_RSA_DOC = (
     "Encrypt plaintext for form submission. password_mode=page uses the loaded page's "
@@ -198,28 +196,31 @@ ENCRYPT_RSA_DOC = (
 REPLAY_REQUEST_DOC = (
     "Replay a captured or registered request with optional field overrides. "
     "refresh_token reloads the referer page and updates _token / X-CSRF-TOKEN. "
-    "encrypt_password re-encrypts the password field via page JS or RSA."
+    "encrypt_password re-encrypts the password field via page JS or RSA. "
+    "Use register_request to persist captures for later replay."
 )
 GET_CAPTURED_REQUEST_HEADERS_DOC = (
     "Get request headers for a captured or registered request id. "
+    "Use the id from requests returned by capture_requests=true actions. "
     "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
     "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
 )
 GET_CAPTURED_REQUEST_BODY_DOC = (
     "Get request body for a captured or registered request id. "
+    "Use the id from requests returned by capture_requests=true actions. "
     "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
     "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
 )
 GET_CAPTURED_RESPONSE_HEADERS_DOC = (
     "Get response headers for a captured or registered request id. "
+    "Use the id from requests returned by capture_requests=true actions. "
     "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
     "Ephemeral captures are cleared on close_session; registered requests persist under registry/."
 )
 REGISTER_REQUEST_DOC = (
     "Persist a captured request id to registry/{request_id}/ as four files: "
     "request_header, response_header, request_body, and response (raw body bytes). "
-    "HTML responses are converted to snapshot YAML when fetched via get_captured_response. "
-    "Optional session_id scopes lookup to one session; otherwise searches active sessions. "
+    "Use after capture_requests=true to save a login or API call for replay_request. "
     "Registered entries are read by get_captured_* tools using only request_id."
 )
 
@@ -259,12 +260,6 @@ async def list_pages(ctx: Context, session_id: str) -> dict:
     return await session.list_pages()
 
 
-@tool(description=DELETE_PAGE_DOC)
-async def delete_page(ctx: Context, session_id: str, page_id: str) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.delete_page(page_id)
-
-
 @tool(description=SWITCH_PAGE_DOC)
 async def switch_page(ctx: Context, session_id: str, page_id: str) -> dict:
     session = _get_manager().get_session(session_id)
@@ -283,38 +278,6 @@ async def goto(
     session = _get_manager().get_session(session_id)
     return await session.goto(
         url,
-        page_id,
-        capture_requests=capture_requests,
-        max_url_len=max_url_len,
-    )
-
-
-@tool(description=GO_BACK_DOC)
-async def go_back(
-    ctx: Context,
-    session_id: str,
-    page_id: str | None = None,
-    capture_requests: bool = False,
-    max_url_len: int = 80,
-) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.go_back(
-        page_id,
-        capture_requests=capture_requests,
-        max_url_len=max_url_len,
-    )
-
-
-@tool(description=GO_FORWARD_DOC)
-async def go_forward(
-    ctx: Context,
-    session_id: str,
-    page_id: str | None = None,
-    capture_requests: bool = False,
-    max_url_len: int = 80,
-) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.go_forward(
         page_id,
         capture_requests=capture_requests,
         max_url_len=max_url_len,
@@ -340,28 +303,6 @@ async def snapshot(
 ) -> dict:
     session = _get_manager().get_session(session_id)
     return await session.page_snapshot(
-        page_id,
-        ref=ref,
-        depth=depth,
-        boxes=boxes,
-        include_urls=include_urls,
-        max_url_len=max_url_len,
-    )
-
-
-@tool(description=INTERACTABLES_DOC)
-async def interactables(
-    ctx: Context,
-    session_id: str,
-    page_id: str | None = None,
-    ref: str | None = None,
-    depth: int | None = None,
-    boxes: bool = False,
-    include_urls: bool = False,
-    max_url_len: int = 80,
-) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.page_interactables(
         page_id,
         ref=ref,
         depth=depth,
@@ -464,31 +405,6 @@ async def click(
     )
 
 
-@tool(description=TYPE_DOC)
-async def type(
-    ctx: Context,
-    session_id: str,
-    ref: str,
-    text: str,
-    page_id: str | None = None,
-    element: str | None = None,
-    submit: bool = False,
-    slowly: bool = False,
-    capture_requests: bool = False,
-    max_url_len: int = 80,
-) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.type_text(
-        ref,
-        text,
-        page_id,
-        submit=submit,
-        slowly=slowly,
-        capture_requests=capture_requests,
-        max_url_len=max_url_len,
-    )
-
-
 @tool(description=FILL_DOC)
 async def fill(
     ctx: Context,
@@ -497,6 +413,8 @@ async def fill(
     value: str,
     page_id: str | None = None,
     element: str | None = None,
+    slowly: bool = False,
+    submit: bool = False,
     capture_requests: bool = False,
     max_url_len: int = 80,
 ) -> dict:
@@ -505,6 +423,8 @@ async def fill(
         ref,
         value,
         page_id,
+        slowly=slowly,
+        submit=submit,
         capture_requests=capture_requests,
         max_url_len=max_url_len,
     )
@@ -552,25 +472,6 @@ async def set_checkbox(
     )
 
 
-@tool(description=SELECT_RADIO_DOC)
-async def select_radio(
-    ctx: Context,
-    session_id: str,
-    ref: str,
-    page_id: str | None = None,
-    element: str | None = None,
-    capture_requests: bool = False,
-    max_url_len: int = 80,
-) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.select_radio(
-        ref,
-        page_id,
-        capture_requests=capture_requests,
-        max_url_len=max_url_len,
-    )
-
-
 @tool(description=UPLOAD_FILES_DOC)
 async def upload_files(
     ctx: Context,
@@ -593,88 +494,6 @@ async def upload_files(
         filepaths=filepaths,
         text=text,
         filename=filename,
-        capture_requests=capture_requests,
-        max_url_len=max_url_len,
-    )
-
-
-@tool(description=SET_SLIDER_DOC)
-async def set_slider(
-    ctx: Context,
-    session_id: str,
-    ref: str,
-    value: float | int | str,
-    page_id: str | None = None,
-    element: str | None = None,
-    capture_requests: bool = False,
-    max_url_len: int = 80,
-) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.set_slider(
-        ref,
-        value,
-        page_id,
-        capture_requests=capture_requests,
-        max_url_len=max_url_len,
-    )
-
-
-@tool(description=SET_SWITCH_DOC)
-async def set_switch(
-    ctx: Context,
-    session_id: str,
-    ref: str,
-    checked: bool,
-    page_id: str | None = None,
-    element: str | None = None,
-    capture_requests: bool = False,
-    max_url_len: int = 80,
-) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.set_switch(
-        ref,
-        checked,
-        page_id,
-        capture_requests=capture_requests,
-        max_url_len=max_url_len,
-    )
-
-
-@tool(description=SET_SPINBUTTON_DOC)
-async def set_spinbutton(
-    ctx: Context,
-    session_id: str,
-    ref: str,
-    value: float | int | str,
-    page_id: str | None = None,
-    element: str | None = None,
-    capture_requests: bool = False,
-    max_url_len: int = 80,
-) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.set_spinbutton(
-        ref,
-        value,
-        page_id,
-        capture_requests=capture_requests,
-        max_url_len=max_url_len,
-    )
-
-
-@tool(description=SELECT_TAB_DOC)
-async def select_tab(
-    ctx: Context,
-    session_id: str,
-    ref: str,
-    page_id: str | None = None,
-    element: str | None = None,
-    capture_requests: bool = False,
-    max_url_len: int = 80,
-) -> dict:
-    session = _get_manager().get_session(session_id)
-    return await session.select_tab(
-        ref,
-        page_id,
         capture_requests=capture_requests,
         max_url_len=max_url_len,
     )

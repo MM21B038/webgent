@@ -44,7 +44,6 @@ from webgent.snapshot import (
     click_ref,
     fill_ref,
     get_node_result,
-    interactables_result,
     is_html_content_type,
     normalize_ref,
     read_locator_value,
@@ -440,6 +439,13 @@ class BrowserSession:
     ) -> dict[str, Any]:
         if requests is not None:
             result["requests"] = requests
+            if requests:
+                sample_ids = ", ".join(entry["id"] for entry in requests[:3])
+                extra = f" (+{len(requests) - 3} more)" if len(requests) > 3 else ""
+                result["capture_hint"] = (
+                    "Use get_captured_response with request_id from requests "
+                    f"(e.g. {sample_ids}{extra})."
+                )
         return result
 
     async def _run_action(
@@ -520,22 +526,6 @@ class BrowserSession:
             )
         return {"pages": pages}
 
-    async def delete_page(self, page_id: str) -> dict[str, Any]:
-        if len(self.pages) <= 1:
-            raise ValueError("Cannot delete the last page in a session")
-        page = self.pages.pop(page_id)
-        self._page_states.pop(page_id, None)
-        was_active = page_id == self.active_page_id
-        if was_active and self.pages:
-            self.active_page_id = next(iter(self.pages))
-        await page.close()
-        if was_active and self.pages:
-            await self.pages[self.active_page_id].bring_to_front()
-        return {
-            "deleted_page_id": page_id,
-            "active_page_id": self.active_page_id,
-        }
-
     async def switch_page(self, page_id: str) -> dict[str, Any]:
         page = self._get_page(page_id)
         self.active_page_id = page_id
@@ -559,66 +549,6 @@ class BrowserSession:
 
         async def do_nav() -> None:
             await page.goto(url)
-            state = await self._sync_page_state(resolved_page_id)
-            state.last_scope_ref = None
-
-        _, requests = await self._with_optional_capture(
-            do_nav,
-            capture_requests=capture_requests,
-            max_url_len=max_url_len,
-        )
-        return self._append_requests(
-            {
-                "page_id": resolved_page_id,
-                "url": page.url,
-                "title": await page.title(),
-            },
-            requests,
-        )
-
-    async def go_back(
-        self,
-        page_id: str | None = None,
-        *,
-        capture_requests: bool = False,
-        max_url_len: int = DEFAULT_MAX_URL_LEN,
-    ) -> dict[str, Any]:
-        page, resolved_page_id = self._resolve_page(page_id)
-
-        async def do_nav() -> None:
-            response = await page.go_back()
-            if response is None:
-                raise ValueError("Cannot go back: no history entry")
-            state = await self._sync_page_state(resolved_page_id)
-            state.last_scope_ref = None
-
-        _, requests = await self._with_optional_capture(
-            do_nav,
-            capture_requests=capture_requests,
-            max_url_len=max_url_len,
-        )
-        return self._append_requests(
-            {
-                "page_id": resolved_page_id,
-                "url": page.url,
-                "title": await page.title(),
-            },
-            requests,
-        )
-
-    async def go_forward(
-        self,
-        page_id: str | None = None,
-        *,
-        capture_requests: bool = False,
-        max_url_len: int = DEFAULT_MAX_URL_LEN,
-    ) -> dict[str, Any]:
-        page, resolved_page_id = self._resolve_page(page_id)
-
-        async def do_nav() -> None:
-            response = await page.go_forward()
-            if response is None:
-                raise ValueError("Cannot go forward: no history entry")
             state = await self._sync_page_state(resolved_page_id)
             state.last_scope_ref = None
 
@@ -787,34 +717,6 @@ class BrowserSession:
         await self._sync_page_state(resolved_page_id)
         return result
 
-    async def page_interactables(
-        self,
-        page_id: str | None = None,
-        *,
-        ref: str | None = None,
-        depth: int | None = None,
-        boxes: bool = False,
-        include_urls: bool = False,
-        max_url_len: int = DEFAULT_MAX_URL_LEN,
-    ) -> dict[str, Any]:
-        page, resolved_page_id = self._resolve_page(page_id)
-        state = await self._ensure_page_state(resolved_page_id)
-        if ref is not None:
-            state.last_scope_ref = normalize_ref(ref)
-        else:
-            state.last_scope_ref = None
-        result = await interactables_result(
-            page,
-            resolved_page_id,
-            scope_ref=ref,
-            depth=depth,
-            boxes=boxes,
-            include_urls=include_urls,
-            max_url_len=max_url_len,
-        )
-        await self._sync_page_state(resolved_page_id)
-        return result
-
     async def get_node(
         self,
         ref: str,
@@ -866,51 +768,25 @@ class BrowserSession:
             max_url_len=max_url_len,
         )
 
-    async def type_text(
-        self,
-        ref: str,
-        text: str,
-        page_id: str | None = None,
-        *,
-        submit: bool = False,
-        slowly: bool = False,
-        capture_requests: bool = False,
-        max_url_len: int = DEFAULT_MAX_URL_LEN,
-    ) -> dict[str, Any]:
-        async def action(page: Page) -> None:
-            locator = ref_locator(page, ref)
-            if slowly:
-                await locator.press_sequentially(text)
-            else:
-                await fill_ref(locator, text)
-            if submit:
-                await locator.press("Enter")
-
-        result = await self._run_action(
-            ref,
-            action,
-            page_id,
-            capture_requests=capture_requests,
-            max_url_len=max_url_len,
-            text=text,
-            submit=submit,
-            slowly=slowly,
-        )
-        page, _ = self._resolve_page(result["page_id"])
-        result["value"] = await read_locator_value(ref_locator(page, ref))
-        return result
-
     async def fill_field(
         self,
         ref: str,
         value: str,
         page_id: str | None = None,
         *,
+        slowly: bool = False,
+        submit: bool = False,
         capture_requests: bool = False,
         max_url_len: int = DEFAULT_MAX_URL_LEN,
     ) -> dict[str, Any]:
         async def action(page: Page) -> None:
-            await fill_ref(ref_locator(page, ref), value)
+            locator = ref_locator(page, ref)
+            if slowly:
+                await locator.press_sequentially(value)
+            else:
+                await fill_ref(locator, value)
+            if submit:
+                await locator.press("Enter")
 
         result = await self._run_action(
             ref,
@@ -969,23 +845,6 @@ class BrowserSession:
             checked=checked,
         )
 
-    async def select_radio(
-        self,
-        ref: str,
-        page_id: str | None = None,
-        *,
-        capture_requests: bool = False,
-        max_url_len: int = DEFAULT_MAX_URL_LEN,
-    ) -> dict[str, Any]:
-        return await self._run_action(
-            ref,
-            lambda page: ref_locator(page, ref).set_checked(True),
-            page_id,
-            capture_requests=capture_requests,
-            max_url_len=max_url_len,
-            checked=True,
-        )
-
     async def upload_files(
         self,
         ref: str,
@@ -1016,86 +875,6 @@ class BrowserSession:
             max_url_len=max_url_len,
             files=names,
             source=source,
-        )
-
-    async def set_slider(
-        self,
-        ref: str,
-        value: float | int | str,
-        page_id: str | None = None,
-        *,
-        capture_requests: bool = False,
-        max_url_len: int = DEFAULT_MAX_URL_LEN,
-    ) -> dict[str, Any]:
-        async def action(page: Page) -> None:
-            await fill_ref(ref_locator(page, ref), str(value))
-
-        result = await self._run_action(
-            ref,
-            action,
-            page_id,
-            capture_requests=capture_requests,
-            max_url_len=max_url_len,
-        )
-        page, _ = self._resolve_page(result["page_id"])
-        result["value"] = await read_locator_value(ref_locator(page, ref))
-        return result
-
-    async def set_switch(
-        self,
-        ref: str,
-        checked: bool,
-        page_id: str | None = None,
-        *,
-        capture_requests: bool = False,
-        max_url_len: int = DEFAULT_MAX_URL_LEN,
-    ) -> dict[str, Any]:
-        return await self._run_action(
-            ref,
-            lambda page: ref_locator(page, ref).set_checked(checked),
-            page_id,
-            capture_requests=capture_requests,
-            max_url_len=max_url_len,
-            checked=checked,
-        )
-
-    async def set_spinbutton(
-        self,
-        ref: str,
-        value: float | int | str,
-        page_id: str | None = None,
-        *,
-        capture_requests: bool = False,
-        max_url_len: int = DEFAULT_MAX_URL_LEN,
-    ) -> dict[str, Any]:
-        async def action(page: Page) -> None:
-            await fill_ref(ref_locator(page, ref), str(value))
-
-        result = await self._run_action(
-            ref,
-            action,
-            page_id,
-            capture_requests=capture_requests,
-            max_url_len=max_url_len,
-        )
-        page, _ = self._resolve_page(result["page_id"])
-        result["value"] = await read_locator_value(ref_locator(page, ref))
-        return result
-
-    async def select_tab(
-        self,
-        ref: str,
-        page_id: str | None = None,
-        *,
-        capture_requests: bool = False,
-        max_url_len: int = DEFAULT_MAX_URL_LEN,
-    ) -> dict[str, Any]:
-        return await self._run_action(
-            ref,
-            lambda page: ref_locator(page, ref).click(no_wait_after=True),
-            page_id,
-            capture_requests=capture_requests,
-            max_url_len=max_url_len,
         )
 
     async def evaluate_js(

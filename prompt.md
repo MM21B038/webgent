@@ -1,57 +1,97 @@
-You have access to the Butcher MCP server. It will perform all web based task and network request capturing tasks and much more.
+You have access to the **webgent** MCP server for browser automation, accessibility snapshots, and HTTP/network capture.
 
-WHEN TO USE THIS SERVER
-If task or any sub task needs to perform any web interaction then in that case this was the best server tools you can use.
+## Always / Never
 
-ORDER OF OPERATION
-1. continue with the already created/used session or create new session (preferred for the different new task).
-2. use the respective best out of butcher server tools to perform any required web action and network request/response capturing.
-3. use snapshot tools to get full page overview and full structured with all interactables already included so this the best tool to use and use it with full scope using depth parameter of it by keeping it large etc. Use it to understand about the page, instructions, headings, text, form instruction, etc. 
-4. use the interactables tool to get only all interactable ref elements only if just needed that only.
-5. if getting stuck/block tools not woking look at the `HANDLING BLOCKERS, ERRORS AND FEEL STUCK STATE` section to handle it in a correct way.
-6. Always take snapshot of the page to take care of the ifame, which was not needed like of the ads/blocking so close that iframe to correctly use actionable tools to work, this was the one of the major reason most of the time actionable tools not working.
-7. always use the respective tool to perform any action on interactive respective ref elements like for example:
-  7.1 use only click tool to click on button element.
-  7.2 you can use click tool to also click on generic ref element and any type of element as well whenever needed but required exact correct ref.
-  7.3 use fill much better then type to fill the content in the element and not just to type else use type.
-    - fill verifies the value was actually written; check the returned `value` field matches what you intended.
-    - prefer fill for textboxes, textareas, and date fields; use type only when you need slow keystrokes or Enter-to-submit.
-  7.3a date / readonly picker fields:
-      - if interactables shows a textbox with `[readonly]`, do NOT use type — it will fail.
-      - use fill with a date string: `dd-mm-yyyy` (recommended, e.g. `15-06-1990`) or `yyyy-mm-dd` try different format which ever with works fine.
-      - fill handles jQuery UI datepicker, flatpickr, and native date inputs automatically.
-      - after fill, confirm `value` in the response (or use get_node) before moving on.
-  7.3b if fill returns "element is readonly" and it is NOT a date field:
-      - the field may be disabled until another choice is made (tab, radio, login mode).
-      - re-fetch interactables, click the required tab/mode first, then fill again.
-  7.4 select option for selecting dropdown option.
-  7.5 use file upload tool to upload via 2 options:
-    - if user provided the absolute file path use that absolute file path.
-    - else use the filename(with extenstion) + text to put into that file or whenever user specifically asked for it. (recommended)
-  7.6 similarly checkbox, radio, etc respectively.
-  7.7 donot use the screenshot tool until unless user specifically specified for to use it.
-  7.8 use `captcha_ocr` with the captcha image ref to read captcha text via ddddocr; then `fill` the captcha input field.
-8. close the session after completing task and doesn't wanted to do more after askeing and confirmation from user.
+**Always**
+- Call **`snapshot`** after navigation, after every action, and after any action failure.
+- Use refs from the **latest** snapshot only.
+- Follow the loop: **`snapshot` → act → `snapshot`**.
 
-PAGE DATA AND HTTP REPLAY
-1. use `get_form_data` to read hidden fields like `_token` and `csrf_token` from meta tags; hidden inputs are not in interactables.
-2. use `evaluate_js` when you need custom page values or to call page-side helper functions.
-3. use `get_cookies` after `goto` to confirm session cookies; use `set_cookies` to seed cookies when needed.
-4. use `get_captured_response(format="raw")` when you need original HTML/text from a captured GET (for example CSRF in page source).
-5. prefer browser login via `fill` + `click` with `capture_requests=true` so page JS handles password encryption automatically.
-6. use `encrypt_rsa` with `password_mode="page"` to encrypt via page JS, or `password_mode="rsa"` with `public_key` for server-side RSA.
-7. use `http_request` for direct HTTP calls with the session cookie jar (POST form data, JSON, or raw body).
-8. use `replay_request` to resend a captured/registered request with `overrides`; set `refresh_token=true` to reload the referer page and refresh `_token` / `X-CSRF-TOKEN` before replay.
+**Never**
+- Do not call **`screenshot`** unless the user explicitly asks for one.
+- Do not guess refs from an older snapshot after the page changed.
 
-HANDLING BLOCKERS, ERRORS AND FEEL STUCK STATE
-1. if any actionabe tools not working like click, type, select option, upload file. there are two possibilities wrong `ref` or the blockers. 
-2. for the 1st type wrong `ref` one you will get that error in the tool response so use interactable/snapshot again for getting update live current ref that you can use.
-3. for the 2nd type blockers which could be popup/modal(cookie banner, ad, dialog) so in this case 
-  - you should use snapshot tool to get full and clear structure first as the close elemen could be generic or other type not could be the input element type.
-  - look for blocking UI under structure parents like dialog or named with like Close / X / Dismiss / Accept / Agree / Got it / Continue / No thanks.
-  - For unnamed generic elements (common with ad/consent UIs), try clicking the generic ref that looks like a close area.
-  - Click the dismiss control first, then re-fetch interactables and click your real target.
+## Session workflow
 
-NOTE
-- only on calling `interactable` or `snapshot` tool the previous these same respective tool call result will be colapse automatically with some short message to maintain the context size.
-- so you can call these both tools on after some action whenever required or page change and url change during the ongoing task.
+1. **`create_session`** — start headed Chromium (reuse `profile_name` when continuing related work).
+2. **`snapshot`** — full page YAML tree with `[ref=…]` markers and `signals` (dialog/iframe blockers).
+3. **Act** — `click`, `fill`, `select_option`, `set_checkbox`, etc. using refs from step 2.
+4. **`snapshot`** again — refresh refs after DOM or URL changes.
+5. **`close_session`** when done (confirm with user if they may continue).
+
+Use **`get_node`** only when you need a deeper subtree for one ref; prefer **`snapshot`** for the full page.
+
+## Role → tool
+
+| Snapshot role | Tool |
+|---------------|------|
+| `textbox`, `searchbox`, `textarea`, `spinbutton`, `slider` | `fill` |
+| `combobox`, `listbox` | `select_option` |
+| `checkbox`, `switch` | `set_checkbox` |
+| `radio`, `tab`, `button`, `link`, `generic` [cursor=pointer] | `click` |
+| `file` | `upload_files` |
+
+## Snapshot format
+
+The tree shows structure, headings, and interactive controls with refs. Enriched lines may include:
+
+- `value="…"` on inputs
+- `checked=true|false` on checkbox, radio, switch
+- `selected="…"` on combobox/listbox
+
+Long lists collapse when count exceeds 30 (configurable): first 10, `... N options omitted ...`, last 10. **Selected/checked items are always kept visible** even if they would fall in the omitted middle.
+
+`signals.dialog_count` and `signals.iframe_hollow_count` summarize blockers without parsing the full tree. Iframe lines may show `(content unavailable)` for cross-origin content.
+
+## Common recipes
+
+**Login icon before fields appear**
+1. `snapshot` — find login/sign-in control
+2. `click` the login trigger
+3. `snapshot` — fields now visible
+4. `fill` username/password, `click` submit
+
+**Overlay, modal, cookie banner, or ad iframe blocking clicks**
+1. `snapshot` — check `signals.dialog_count` / iframe markers
+2. `click` dismiss (Close, X, Accept, Got it, etc.; generic refs are common)
+3. `snapshot` — confirm blocker gone
+4. `click` or `fill` your real target
+
+**Readonly field before fill**
+- If fill fails with a hint about readonly/disabled, click the required tab/mode/login trigger first, then `snapshot` and fill again.
+
+**Date / readonly picker**
+- Use `fill` with `dd-mm-yyyy` (e.g. `15-06-1990`) or `yyyy-mm-dd`; confirm returned `value`.
+
+**Fill flags**
+- `slowly=true` — type character-by-character (some sites validate on keypress)
+- `submit=true` — press Enter after fill
+
+## HTTP and network capture
+
+1. Run actions with **`capture_requests=true`** — response includes `requests` (id, method, url, status) and `capture_hint`.
+2. Use **`get_captured_request_headers`**, **`get_captured_request_body`**, **`get_captured_response_headers`**, **`get_captured_response`** with the request id.
+3. Optional: **`register_request`** to persist under `registry/` for later **`replay_request`**.
+
+**When to use what**
+- **Browser login** — `fill` + `click` with `capture_requests=true` when page JS handles password encryption.
+- **`http_request`** — direct HTTP with session cookies (POST form, JSON, raw body).
+- **`replay_request`** — resend a captured/registered request with overrides; `refresh_token=true` reloads CSRF from the referer page.
+- **`get_form_data`** — hidden fields and `csrf_token` from meta (not in snapshot refs).
+- **`get_cookies`** / **`set_cookies`** — inspect or seed session cookies.
+- **`encrypt_rsa`** — `password_mode=page` (page JS) or `password_mode=rsa` with `public_key`.
+
+## Other tools
+
+- **`get_url`** — full href for a link ref (snapshot may truncate long URLs).
+- **`captcha_ocr`** — OCR captcha image ref, then `fill` the captcha field.
+- **`evaluate_js`** — custom page values or page-side helpers.
+- **`upload_files`** — absolute path from user, or generated filename + content when requested.
+
+## Errors and hints
+
+Action errors may include a **`hint`** field (e.g. refresh refs, dismiss overlay, click tab first). Always **`snapshot`** after fixing the cause.
+
+## Context note
+
+Only the latest **`snapshot`** result stays expanded; earlier snapshot outputs may collapse to save context. Re-run **`snapshot`** whenever the page may have changed.
