@@ -118,6 +118,7 @@ GET_NODE_DOC = (
 GET_URL_DOC = "Get the full href for a link ref."
 CLICK_DOC = (
     "Click by ref (button, tab, radio, link, or generic). "
+    "Scrolls into view first; off-screen elements fall back to DOM click. "
     "Falls back when a visible overlay intercepts pointer events. "
     "On failure, check error hint and run snapshot to find blockers. "
     + _ACTION_DOC
@@ -125,6 +126,7 @@ CLICK_DOC = (
 )
 FILL_DOC = (
     "Fill textbox, searchbox, textarea, spinbutton, slider, or date field by ref. "
+    "Scrolls into view first with DOM fallback for off-screen fields. "
     "Verifies the value was written; check returned value. "
     "slowly=true types character-by-character; submit=true presses Enter after fill. "
     "Readonly date pickers accept dd-mm-yyyy or yyyy-mm-dd. "
@@ -132,14 +134,22 @@ FILL_DOC = (
     + _CAPTURE_DOC
 )
 SELECT_OPTION_DOC = (
-    "Select combobox or listbox values by ref. " + _ACTION_DOC + _CAPTURE_DOC
-)
-SET_CHECKBOX_DOC = (
-    "Set checkbox or switch checked state by ref (checked true/false). "
+    "Select combobox or listbox values by ref. "
+    "Scrolls into view first with DOM fallback for off-screen controls. "
     + _ACTION_DOC
     + _CAPTURE_DOC
 )
-UPLOAD_FILES_DOC = "Upload to a file input by ref. " + _ACTION_DOC + _CAPTURE_DOC
+SET_CHECKBOX_DOC = (
+    "Set checkbox or switch checked state by ref (checked true/false). "
+    "Scrolls into view first with DOM fallback for off-screen controls. "
+    + _ACTION_DOC
+    + _CAPTURE_DOC
+)
+UPLOAD_FILES_DOC = (
+    "Upload to a file input by ref. Scrolls into view before attaching files. "
+    + _ACTION_DOC
+    + _CAPTURE_DOC
+)
 SCREENSHOT_DOC = (
     "Save a viewport, full-page, or element PNG/JPEG under media/. "
     "Do not use unless the user explicitly asks for a screenshot."

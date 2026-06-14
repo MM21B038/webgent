@@ -46,10 +46,14 @@ from webgent.snapshot import (
     get_node_result,
     is_html_content_type,
     normalize_ref,
+    press_sequentially_ref,
     read_locator_value,
     read_page_signals,
     ref_locator,
     resolve_ref_locator,
+    select_option_ref,
+    set_checked_ref,
+    set_input_files_ref,
     snapshot_result,
 )
 
@@ -782,7 +786,7 @@ class BrowserSession:
         async def action(page: Page) -> None:
             locator = ref_locator(page, ref)
             if slowly:
-                await locator.press_sequentially(value)
+                await press_sequentially_ref(locator, value)
             else:
                 await fill_ref(locator, value)
             if submit:
@@ -814,7 +818,7 @@ class BrowserSession:
 
         async def action(page: Page) -> None:
             nonlocal selected_values
-            selected_values = await ref_locator(page, ref).select_option(values)
+            selected_values = await select_option_ref(ref_locator(page, ref), values)
 
         result = await self._run_action(
             ref,
@@ -838,7 +842,7 @@ class BrowserSession:
     ) -> dict[str, Any]:
         return await self._run_action(
             ref,
-            lambda page: ref_locator(page, ref).set_checked(checked),
+            lambda page: set_checked_ref(ref_locator(page, ref), checked),
             page_id,
             capture_requests=capture_requests,
             max_url_len=max_url_len,
@@ -865,7 +869,7 @@ class BrowserSession:
         )
 
         async def action(page: Page) -> None:
-            await ref_locator(page, ref).set_input_files(files)
+            await set_input_files_ref(ref_locator(page, ref), files)
 
         return await self._run_action(
             ref,

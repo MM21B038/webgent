@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 from playwright.async_api import BrowserContext, Locator, Page
 
 from webgent.config import get_settings
@@ -551,6 +552,56 @@ _SET_DATEPICKER_VALUE_JS = """(el, val) => {
 }"""
 
 
+_OFFSCREEN_ACTION_HINT = (
+    "Element may be off-screen or inside a scrollable dialog. "
+    "Dismiss cookie/welcome banners first, then snapshot and retry."
+)
+_ACTION_TIMEOUT_MS = DEFAULT_CLICK_TIMEOUT_MS
+_T = TypeVar("_T")
+
+
+def _action_needs_offscreen_fallback(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    if "outside of the viewport" in message or "outside viewport" in message:
+        return True
+    if "not visible" in message:
+        return True
+    return "timeout" in message and any(
+        token in message for token in ("visible", "stable", "enabled", "receives events")
+    )
+
+
+async def _scroll_ref_into_view(locator: Locator) -> None:
+    await locator.scroll_into_view_if_needed(timeout=_ACTION_TIMEOUT_MS)
+
+
+async def _with_actionability(
+    locator: Locator,
+    action: Callable[[], Awaitable[_T]],
+    *,
+    js_fallback: Callable[[], Awaitable[_T]] | None = None,
+    force_action: Callable[[], Awaitable[_T]] | None = None,
+    hint: str = _OFFSCREEN_ACTION_HINT,
+) -> _T:
+    await _scroll_ref_into_view(locator)
+    try:
+        return await action()
+    except Exception as exc:
+        if not _action_needs_offscreen_fallback(exc):
+            raise
+        if js_fallback is not None:
+            try:
+                return await js_fallback()
+            except Exception:
+                pass
+        if force_action is not None:
+            try:
+                return await force_action()
+            except Exception as force_exc:
+                raise ActionError(str(force_exc), hint=hint) from force_exc
+        raise ActionError(str(exc), hint=hint) from exc
+
+
 async def fill_ref(locator: Locator, value: str) -> str:
     state = await locator.evaluate(_DETECT_FILL_STATE_JS)
     if state.get("disabled"):
@@ -579,21 +630,159 @@ async def fill_ref(locator: Locator, value: str) -> str:
             hint="Click the required tab, mode, or login trigger first, then snapshot again.",
         )
 
-    await locator.fill(value)
-    actual = await read_locator_value(locator)
-    if actual != value:
+    async def verify_fill() -> str:
+        actual = await read_locator_value(locator)
+        if actual != value:
+            raise ValueError(
+                f"Fill failed: expected {value!r}, got {actual!r}. "
+                "The element may be readonly, disabled, or not an editable input."
+            )
+        return actual
+
+    async def do_fill() -> str:
+        await locator.fill(value)
+        actual = await read_locator_value(locator)
+        if actual != value:
+            await locator.evaluate(_SYNC_INPUT_VALUE_JS, value)
+        return await verify_fill()
+
+    async def js_fill() -> str:
+        await locator.evaluate(
+            """(el) => {
+                if (!(el instanceof HTMLElement)) {
+                    throw new Error("Ref is not a fillable element");
+                }
+                el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+            }"""
+        )
+        await locator.evaluate(_SYNC_INPUT_VALUE_JS, value)
+        return await verify_fill()
+
+    return await _with_actionability(locator, do_fill, js_fallback=js_fill)
+
+
+async def press_sequentially_ref(locator: Locator, value: str) -> None:
+    async def do_type() -> None:
+        await locator.press_sequentially(value)
+
+    async def js_fill() -> None:
+        await locator.evaluate(
+            """(el) => {
+                if (!(el instanceof HTMLElement)) {
+                    throw new Error("Ref is not a fillable element");
+                }
+                el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+            }"""
+        )
         await locator.evaluate(_SYNC_INPUT_VALUE_JS, value)
         actual = await read_locator_value(locator)
-    if actual != value:
-        raise ValueError(
-            f"Fill failed: expected {value!r}, got {actual!r}. "
-            "The element may be readonly, disabled, or not an editable input."
+        if actual != value:
+            raise ValueError(
+                f"Fill failed: expected {value!r}, got {actual!r}. "
+                "The element may be readonly, disabled, or not an editable input."
+            )
+
+    await _with_actionability(locator, do_type, js_fallback=js_fill)
+
+
+async def select_option_ref(locator: Locator, values: list[str]) -> list[str]:
+    async def do_select() -> list[str]:
+        return await locator.select_option(values)
+
+    async def js_select() -> list[str]:
+        await locator.evaluate(
+            """(el, vals) => {
+                if (!(el instanceof HTMLSelectElement)) {
+                    throw new Error("Ref is not a select element");
+                }
+                el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+                const wanted = new Set(vals);
+                for (const option of el.options) {
+                    const match =
+                        wanted.has(option.value)
+                        || wanted.has(option.label)
+                        || wanted.has(option.text);
+                    option.selected = match;
+                }
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+            }""",
+            values,
         )
-    return actual
+        return await locator.evaluate(
+            """(el) => [...el.selectedOptions].map((option) => option.value)"""
+        )
+
+    return await _with_actionability(locator, do_select, js_fallback=js_select)
+
+
+async def set_checked_ref(locator: Locator, checked: bool) -> None:
+    async def do_set() -> None:
+        await locator.set_checked(checked)
+
+    async def js_set() -> None:
+        await locator.evaluate(
+            """(el, nextChecked) => {
+                if (!(el instanceof HTMLElement)) {
+                    throw new Error("Ref is not a checkable element");
+                }
+                el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+                if ("checked" in el) {
+                    el.checked = nextChecked;
+                } else {
+                    throw new Error("Ref is not a checkable element");
+                }
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+            }""",
+            checked,
+        )
+
+    await _with_actionability(locator, do_set, js_fallback=js_set)
+
+
+async def set_input_files_ref(
+    locator: Locator,
+    files: str | list[str],
+) -> None:
+    async def do_upload() -> None:
+        await locator.set_input_files(files)
+
+    await _with_actionability(locator, do_upload)
 
 
 def _click_intercepted(exc: BaseException) -> bool:
     return "intercepts pointer" in str(exc).lower()
+
+
+_JS_CLICK_WITH_SCROLL = """(el) => {
+    if (!(el instanceof HTMLElement)) {
+        throw new Error("Ref is not a clickable element");
+    }
+    el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    el.click();
+}"""
+
+
+async def _click_through_overlay(
+    locator: Locator,
+    click_kwargs: dict[str, Any],
+) -> bool:
+    clicked_overlay = await locator.evaluate(
+        """(el) => {
+            const rect = el.getBoundingClientRect();
+            const x = rect.left + rect.width / 2;
+            const y = rect.top + rect.height / 2;
+            const target = document.elementFromPoint(x, y);
+            if (!target || target === el) return false;
+            target.click();
+            return true;
+        }"""
+    )
+    if clicked_overlay:
+        return True
+    await locator.click(force=True, **click_kwargs)
+    return True
 
 
 async def click_ref(page: Page, ref: str) -> None:
@@ -604,34 +793,36 @@ async def click_ref(page: Page, ref: str) -> None:
         "timeout": DEFAULT_CLICK_TIMEOUT_MS,
     }
     try:
+        await _scroll_ref_into_view(locator)
         await locator.click(**click_kwargs)
     except Exception as exc:
-        if not _click_intercepted(exc):
-            raise
-        clicked_overlay = await locator.evaluate(
-            """(el) => {
-                const rect = el.getBoundingClientRect();
-                const x = rect.left + rect.width / 2;
-                const y = rect.top + rect.height / 2;
-                const target = document.elementFromPoint(x, y);
-                if (!target || target === el) return false;
-                target.click();
-                return true;
-            }"""
-        )
-        if not clicked_overlay:
+        if _click_intercepted(exc):
             try:
-                await locator.click(force=True, **click_kwargs)
-            except Exception as force_exc:
-                if _click_intercepted(force_exc):
+                await _click_through_overlay(locator, click_kwargs)
+                return
+            except Exception as overlay_exc:
+                if _click_intercepted(overlay_exc):
                     raise ActionError(
-                        str(force_exc),
+                        str(overlay_exc),
                         hint=(
                             "Possible overlay, modal, or iframe is blocking the click. "
                             "Run snapshot, dismiss the blocker, then retry."
                         ),
-                    ) from force_exc
+                    ) from overlay_exc
                 raise
+        if _action_needs_offscreen_fallback(exc):
+            try:
+                await locator.evaluate(_JS_CLICK_WITH_SCROLL)
+                return
+            except Exception:
+                try:
+                    await locator.click(force=True, **click_kwargs)
+                    return
+                except Exception as force_exc:
+                    raise ActionError(
+                        str(force_exc), hint=_OFFSCREEN_ACTION_HINT
+                    ) from force_exc
+        raise
 
 
 def extract_ref_from_line(line: str) -> str | None:

@@ -74,6 +74,21 @@ DIALOG_PAGE_URL = (
     "</body></html>"
 )
 
+OFFSCREEN_CLICK_PAGE_URL = (
+    "data:text/html,<html><body style='height:3000px;margin:0'>"
+    "<div style='height:1200px'></div>"
+    "<input aria-label='Far email field' value=''>"
+    "<label><input type='checkbox' aria-label='Far subscribe'>Subscribe</label>"
+    "<select aria-label='Far country'><option value=''>Choose</option>"
+    "<option value='us'>United States</option></select>"
+    "<button aria-label='Far below fold'>Far below fold</button>"
+    "<script>"
+    "document.querySelector('button').onclick=function(){"
+    "document.title='Far button clicked';};"
+    "</script>"
+    "</body></html>"
+)
+
 OVERLAY_SELECT_PAGE_URL = (
     "data:text/html,<html><body>"
     "<div style='position:relative;display:inline-block'>"
@@ -883,6 +898,41 @@ async def test_action_metadata_only() -> None:
 
         await manager.close_session(session_info["session_id"])
         print("action metadata only smoke test passed")
+    finally:
+        await manager.stop()
+
+
+async def test_click_offscreen_element() -> None:
+    manager = BrowserManager()
+    await manager.start()
+    try:
+        session_info = await manager.create_session(
+            "offscreen-click-test",
+            initial_url=OFFSCREEN_CLICK_PAGE_URL,
+        )
+        session = manager.get_session(session_info["session_id"])
+        snapshot = await session.page_snapshot()
+        far_ref = find_ref(snapshot["snapshot"], "far", "below", "fold")
+        email_ref = find_ref(snapshot["snapshot"], "textbox", "email")
+        checkbox_ref = find_ref(snapshot["snapshot"], "checkbox", "subscribe")
+        country_ref = find_ref(snapshot["snapshot"], "combobox", "country")
+        assert far_ref is not None
+        assert email_ref is not None
+        assert checkbox_ref is not None
+        assert country_ref is not None
+
+        filled = await session.fill_field(email_ref, "offscreen@example.com")
+        assert filled["value"] == "offscreen@example.com"
+        checked = await session.set_checkbox(checkbox_ref, True)
+        assert checked["checked"] is True
+        selected = await session.select_option(country_ref, ["United States"])
+        assert selected["selected"] == ["us"]
+
+        clicked = await session.click(far_ref)
+        assert clicked["ref"] == far_ref
+        page = session.pages[clicked["page_id"]]
+        assert await page.title() == "Far button clicked"
+        print("offscreen actionable tools smoke test passed")
     finally:
         await manager.stop()
 
@@ -1713,6 +1763,7 @@ async def main() -> None:
     await test_vision_query()
     await test_browser_manager()
     await test_action_metadata_only()
+    await test_click_offscreen_element()
     await test_fill_verifies_dom_value()
     await test_state_enrichment_helpers()
     await test_network_capture()
