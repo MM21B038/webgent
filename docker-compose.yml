@@ -1,0 +1,38 @@
+services:
+  webgent:
+    build: .
+    image: webgent:latest
+    container_name: webgent
+    restart: unless-stopped
+    init: true
+    shm_size: "2gb"
+    ports:
+      - "3333:3333"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      WEBGENT_IN_DOCKER: "1"
+      WEBGENT_SERVER_HOST: "0.0.0.0"
+      WEBGENT_HEADLESS: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./settings.toml:/app/settings.toml:ro
+      - ./prompt.md:/app/prompt.md:ro
+      - ./profile:/app/profile
+      - ./media:/app/media
+      - ./registry:/app/registry
+      - ./mitmproxy:/app/mitmproxy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1', 3333), 2); s.close()",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 40s

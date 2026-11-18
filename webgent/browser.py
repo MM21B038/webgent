@@ -80,6 +80,20 @@ def profile_path(profile_name: str) -> str:
     return str(path)
 
 
+def _merge_chromium_args(launch_kwargs: dict[str, Any]) -> None:
+    extra = list(get_settings().browser.chromium_args)
+    if not extra:
+        return
+    existing = list(launch_kwargs.get("args") or [])
+    seen = set(existing)
+    merged = list(existing)
+    for arg in extra:
+        if arg not in seen:
+            seen.add(arg)
+            merged.append(arg)
+    launch_kwargs["args"] = merged
+
+
 async def page_info(page: Page, page_id: str, is_active: bool) -> dict[str, Any]:
     return {
         "page_id": page_id,
@@ -125,6 +139,7 @@ class ProfileBrowser:
         }
         if launch_extras:
             launch_kwargs.update(launch_extras)
+        _merge_chromium_args(launch_kwargs)
         context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
         profile = cls(safe_name, context, proxy_capture=proxy_capture)
         profile._install_context_listener()
@@ -1197,8 +1212,10 @@ class BrowserManager:
         if self._playwright is None:
             return None
         if self._transform_context is None:
+            launch_kwargs: dict[str, Any] = {"headless": True}
+            _merge_chromium_args(launch_kwargs)
             self._transform_browser = await self._playwright.chromium.launch(
-                headless=True,
+                **launch_kwargs,
             )
             self._transform_context = await self._transform_browser.new_context()
         return self._transform_context

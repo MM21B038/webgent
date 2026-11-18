@@ -23,3 +23,6 @@ registry/*
 
 # mitmproxy CA and config
 mitmproxy/
+
+# Environment variables
+.env

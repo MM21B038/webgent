@@ -2497,6 +2497,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "mitmproxy" },
     { name = "playwright" },
+    { name = "python-dotenv" },
 ]
 
 [package.metadata]
@@ -2507,6 +2508,7 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=3.4.0" },
     { name = "mitmproxy", specifier = ">=12.2.3" },
     { name = "playwright", specifier = ">=1.60.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
 ]
 
 [[package]]

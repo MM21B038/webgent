@@ -16,10 +16,9 @@ from fastmcp import Context, FastMCP
 
 from webgent.browser import BrowserManager
 from webgent.config import (
-    PROMPT_NAME,
     PROMPT_PATH,
     README_PATH,
-    SERVER_INFO_RESOURCE_URI,
+    get_settings,
 )
 from webgent.mcp_tools import ToolErrorAsResponseMiddleware, wrap_tool_result
 
@@ -41,6 +40,7 @@ async def app_lifespan(server):
 
 mcp = FastMCP("webgent", lifespan=app_lifespan)
 mcp.add_middleware(ToolErrorAsResponseMiddleware())
+_mcp_cursor = get_settings().mcp_cursor
 
 
 def _get_manager() -> BrowserManager:
@@ -63,7 +63,7 @@ def _read_project_markdown(path: Path) -> str:
 
 
 @mcp.resource(
-    SERVER_INFO_RESOURCE_URI,
+    _mcp_cursor.server_info_resource,
     name="server-info",
     description="Project README: install, configuration, tools, and agent workflow.",
     mime_type="text/markdown",
@@ -73,7 +73,7 @@ def readme() -> str:
 
 
 @mcp.prompt(
-    name=PROMPT_NAME,
+    name=_mcp_cursor.prompt,
     description="Agent instructions for when and how to use webgent MCP tools.",
 )
 def prompt() -> str:

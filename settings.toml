@@ -1,3 +1,8 @@
+# Defaults baked into the Docker image. Runtime overrides (no rebuild):
+#   1) .env / WEBGENT_* environment variables (highest priority)
+#   2) bind-mounted settings.toml or WEBGENT_SETTINGS_PATH
+# Model names: WEBGENT_LLM_MODEL, WEBGENT_VLM_MODEL, WEBGENT_EMB_MODEL
+
 [browser]
 # Run Chromium without a visible window (useful on servers or SSH).
 headless = false
@@ -20,6 +25,8 @@ max_body_bytes = 1048576
 bypass_loopback = false
 
 [server]
+# HTTP Streamable MCP (not stdio). Endpoint: http://{host}:{port}/mcp
+# In Docker the image binds 0.0.0.0 via WEBGENT_SERVER_HOST; keep 127.0.0.1 for local uv.
 transport = "http"
 host = "127.0.0.1"
 port = 3333
